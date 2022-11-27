@@ -1,6 +1,8 @@
 # fig
 An animated wallpaper tool for gifs
 
+![desktop](https://user-images.githubusercontent.com/410846/204144644-c3dfdf91-3512-43a5-a91c-1f2ce2e158b5.gif)
+
 Using [paperview](https://github.com/glouw/paperview) as a prompt this is the second tool in the series for practicing writting the same behavior multiple times and in different languages.
 The first was [zaper](https://github.com/whytheplatypus/zaper).
 The goal for this round is to accept gif files without any preprocessing needed.
