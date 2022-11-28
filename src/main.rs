@@ -5,18 +5,15 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 use x11rb::errors::{ReplyOrIdError, ConnectionError};
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::cookie::VoidCookie;
-use image::codecs::gif::{GifDecoder, GifEncoder};
-use image::{ImageDecoder, AnimationDecoder};
+use image::codecs::gif::GifDecoder;
+use image::AnimationDecoder;
 use std::ffi::c_void;
 use std::fs::File;
 use std::{thread, time::Duration};
 use sdl2::video::Window;
 use sdl2::render::Canvas;
-use sdl2::render::TextureCreator;
-use sdl2::surface::Surface;
 use sdl2::image::LoadTexture;
 use sdl2_sys::SDL_CreateWindowFrom;
-use sdl2::pixels::PixelFormatEnum;
 use std::env::temp_dir;
 use std::env;
 use sdl2::render::Texture;
@@ -39,19 +36,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let args: Vec<String> = env::args().collect();
 
-    // switch to a slice of files
     let gifs = dbg!(&args[1..args.len()]);
-    let gif = &gifs[0];
-
-    println!("Rendering file {}", gif);
 
     let (conn, screen_num) = x11rb::connect(None).unwrap();
 
     let screens = dbg!(query_screens(&conn).unwrap().reply().unwrap());
 
     let win_id = create_desktop(&conn, screen_num).unwrap();
-    set_desktop_atoms(&conn, win_id);
-    show_desktop(&conn, win_id);
+    set_desktop_atoms(&conn, win_id)?;
+    show_desktop(&conn, win_id)?;
 
 
     println!("Created {:?}", win_id);
@@ -72,7 +65,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut wallpapers = Vec::new();
         for gif in gifs {
             let file_in = File::open(gif)?;
-            let mut decoder = GifDecoder::new(file_in).unwrap();
+            let decoder = GifDecoder::new(file_in).unwrap();
             let frames = decoder.into_frames();
 
             let mut stack = Vec::new();
@@ -80,7 +73,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let tmp_frame = format!("{}/fig_frame.bmp", temp_dir().to_str().unwrap());
 
                 print!("\rLoading frame {} ", i);
-                std::io::stdout().flush();
+                std::io::stdout().flush().unwrap();
 
                 let frame = result.unwrap();
                 let (delay, _) = frame.delay().numer_denom_ms();
@@ -105,7 +98,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
                     let texture = &stack.frames[stack.index].texture;
                     // then move to this
-                    canvas.copy(&texture, None, rect);
+                    canvas.copy(&texture, None, rect).unwrap();
                     canvas.present();
                     stack.index = (stack.index + 1) % stack.count;
                 }
