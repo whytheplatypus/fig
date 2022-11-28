@@ -1,4 +1,4 @@
-use std::io::{Write, BufWriter, Cursor};
+use std::io::{Write, Cursor};
 use std::ffi::c_void;
 use std::fs::File;
 use std::{thread, time::Duration};
@@ -25,10 +25,33 @@ struct Frame<'a> {
     texture: Texture<'a>,
 }
 
+#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct RawFrame {
+    index: usize,
+    delay: u32,
+    pixels: Vec::<u8>,
+}
+
 struct Stack<'a> {
     count: usize,
     index: usize,
     frames: Vec::<Frame<'a>>,
+}
+
+impl Stack<'_> {
+    fn next(&mut self) -> &Frame {
+        let frame = &self.frames[self.index];
+        self.index = (self.index + 1) % self.count;
+        frame
+    }
+
+    fn peek(&self) -> &Frame {
+        &self.frames[self.index]
+    }
+
+    fn total_time(&self) -> u32 {
+        self.frames.iter().map(|frame| frame.delay).sum()
+    }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -47,6 +70,80 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 
     println!("Created {:?}", win_id);
+
+    let mut canvas = create_canvas(win_id)?;
+    let texture_creator = canvas.texture_creator();
+
+    let mut wallpapers = Vec::new();
+
+    for gif in gifs {
+        let raw_stack = load_raw_frames(gif)?;
+        let stack = load_textures(&texture_creator, raw_stack)?;
+        wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
+    }
+
+    let mut screen_rects = Vec::new();
+    for screen in screens.screen_info {
+        let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
+        screen_rects.push(rect);
+    }
+
+    let mut count: u32 = 0;
+    let max: u32 = dbg!(wallpapers.iter().map(|wallpaper| wallpaper.total_time()).sum());
+    loop {
+        for (i, rect) in screen_rects.iter().enumerate() {
+            let len = wallpapers.len();
+            let stack = &mut wallpapers[i%len];
+            let delay = stack.peek().delay;
+            if count % delay == 0 {
+                let texture = &stack.next().texture;
+                canvas.copy(texture, None, *rect).unwrap();
+                canvas.present();
+            }
+        }
+        count = (count + 1) % max;
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn load_textures(texture_creator: &impl LoadTexture, raw_stack: Vec::<RawFrame>) -> Result<Vec::<Frame>, Box<dyn std::error::Error>> {
+    let mut stack = Vec::new();
+    for frame in raw_stack {
+        let texture = texture_creator.load_texture_bytes(&frame.pixels)?;
+        stack.push(Frame{ delay: frame.delay, texture });
+    }
+    Ok(stack)
+}
+
+fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::Error>> {
+    let file_in = File::open(gif)?;
+    let decoder = GifDecoder::new(file_in)?;
+    let frames = decoder.into_frames();
+
+    let mut raw_stack = Vec::new();
+    for (i, result) in frames.enumerate() {
+        print!("\rLoading frame {} ", i);
+        std::io::stdout().flush()?;
+        let index = i;
+        let frame = result?;
+        let (delay, _) = frame.delay().numer_denom_ms();
+        let pixels = load_frame(frame)?;
+        raw_stack.push(RawFrame{ index, delay, pixels });
+    }
+
+
+    raw_stack.sort();
+    Ok(raw_stack)
+}
+
+fn load_frame(frame: image::Frame) -> Result<Vec::<u8>, Box<dyn std::error::Error>> {
+    let buffer = frame.into_buffer();
+    let mut buf = Cursor::new(Vec::new());
+    buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
+    Ok(buf.into_inner())
+}
+
+fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Error>>{
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
 
@@ -56,57 +153,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // We get the canvas from which we can get the `TextureCreator`.
-    let mut canvas: Canvas<Window> = win.into_canvas()
+    let canvas: Canvas<Window> = win.into_canvas()
         .build()
         .expect("failed to build window's canvas");
-    let texture_creator = canvas.texture_creator();
-
-
-    let mut wallpapers = Vec::new();
-    for gif in gifs {
-        let file_in = File::open(gif)?;
-        let decoder = GifDecoder::new(file_in).unwrap();
-        let frames = decoder.into_frames();
-
-        let mut stack = Vec::new();
-        for (i, result) in frames.enumerate() {
-            //let tmp_frame = format!("{}/fig_frame.bmp", env::temp_dir().to_str().unwrap());
-
-            print!("\rLoading frame {} ", i);
-            std::io::stdout().flush().unwrap();
-
-            let frame = result.unwrap();
-            let (delay, _) = frame.delay().numer_denom_ms();
-            let buffer = frame.into_buffer();
-            let mut buf = Cursor::new(Vec::new());
-            buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
-            let pixels = buf.into_inner();
-            let texture = texture_creator.load_texture_bytes(&pixels).unwrap();
-            stack.push(Frame{ delay, texture });
-            // can we scale early?
-        }
-        wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
-    }
-
-    let mut count: u32 = 0;
-    let max: u32 = dbg!(wallpapers.iter().map(|wallpaper| wallpaper.frames.iter().map(|frame| frame.delay).sum::<u32>()).sum());
-    loop {
-        for (i, screen) in screens.screen_info.iter().enumerate() {
-            let len = wallpapers.len();
-            let stack = &mut wallpapers[i%len];
-            let delay = stack.frames[stack.index].delay;
-            if count % delay == 0 {
-                let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
-                let texture = &stack.frames[stack.index].texture;
-                // then move to this
-                canvas.copy(texture, None, rect).unwrap();
-                canvas.present();
-                stack.index = (stack.index + 1) % stack.count;
-            }
-        }
-        count = (count + 1) % max;
-        thread::sleep(Duration::from_millis(1));
-    }
+    Ok(canvas)
 }
 
 fn set_desktop_atoms(conn: &impl Connection, win_id: u32) -> Result<VoidCookie<'_, impl Connection>, ConnectionError> {
