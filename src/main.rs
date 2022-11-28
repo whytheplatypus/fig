@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Write, BufWriter, Cursor};
 use std::ffi::c_void;
 use std::fs::File;
 use std::{thread, time::Duration};
@@ -12,6 +12,7 @@ use x11rb::wrapper::ConnectionExt as _;
 use x11rb::cookie::VoidCookie;
 use image::codecs::gif::GifDecoder;
 use image::AnimationDecoder;
+use image::ImageOutputFormat;
 use sdl2::video::Window;
 use sdl2::render::{Canvas, Texture};
 use sdl2::image::LoadTexture;
@@ -49,63 +50,62 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let sdl_context = sdl2::init()?;
     let video_subsystem = sdl_context.video()?;
 
-    unsafe {
+    let win = unsafe {
         let sdl_win = SDL_CreateWindowFrom(win_id as *const c_void);
-        let win = Window::from_ll(video_subsystem, sdl_win);
+        Window::from_ll(video_subsystem, sdl_win)
+    };
 
-        // We get the canvas from which we can get the `TextureCreator`.
-        let mut canvas: Canvas<Window> = win.into_canvas()
-            .build()
-            .expect("failed to build window's canvas");
-        let texture_creator = canvas.texture_creator();
+    // We get the canvas from which we can get the `TextureCreator`.
+    let mut canvas: Canvas<Window> = win.into_canvas()
+        .build()
+        .expect("failed to build window's canvas");
+    let texture_creator = canvas.texture_creator();
 
 
-        let mut wallpapers = Vec::new();
-        for gif in gifs {
-            let file_in = File::open(gif)?;
-            let decoder = GifDecoder::new(file_in).unwrap();
-            let frames = decoder.into_frames();
+    let mut wallpapers = Vec::new();
+    for gif in gifs {
+        let file_in = File::open(gif)?;
+        let decoder = GifDecoder::new(file_in).unwrap();
+        let frames = decoder.into_frames();
 
-            let mut stack = Vec::new();
-            for (i, result) in frames.enumerate() {
-                let tmp_frame = format!("{}/fig_frame.bmp", env::temp_dir().to_str().unwrap());
+        let mut stack = Vec::new();
+        for (i, result) in frames.enumerate() {
+            //let tmp_frame = format!("{}/fig_frame.bmp", env::temp_dir().to_str().unwrap());
 
-                print!("\rLoading frame {} ", i);
-                std::io::stdout().flush().unwrap();
+            print!("\rLoading frame {} ", i);
+            std::io::stdout().flush().unwrap();
 
-                let frame = result.unwrap();
-                let (delay, _) = frame.delay().numer_denom_ms();
-                let buffer = frame.into_buffer();
-                buffer.save(&tmp_frame).unwrap();
-                // can do this to load all textures
-                let texture = texture_creator.load_texture(&tmp_frame).unwrap();
-                stack.push(Frame{ delay, texture });
-                // can we scale early?
-            }
-            wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
+            let frame = result.unwrap();
+            let (delay, _) = frame.delay().numer_denom_ms();
+            let buffer = frame.into_buffer();
+            let mut buf = Cursor::new(Vec::new());
+            buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
+            let pixels = buf.into_inner();
+            let texture = texture_creator.load_texture_bytes(&pixels).unwrap();
+            stack.push(Frame{ delay, texture });
+            // can we scale early?
         }
+        wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
+    }
 
-        let mut count: u32 = 0;
-        let max: u32 = dbg!(wallpapers.iter().map(|wallpaper| wallpaper.frames.iter().map(|frame| frame.delay).sum::<u32>()).sum());
-        loop {
-            for (i, screen) in screens.screen_info.iter().enumerate() {
-                let len = wallpapers.len();
-                let stack = &mut wallpapers[i%len];
-                let delay = stack.frames[stack.index].delay;
-                if count % delay == 0 {
-                    let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
-                    let texture = &stack.frames[stack.index].texture;
-                    // then move to this
-                    canvas.copy(texture, None, rect).unwrap();
-                    canvas.present();
-                    stack.index = (stack.index + 1) % stack.count;
-                }
+    let mut count: u32 = 0;
+    let max: u32 = dbg!(wallpapers.iter().map(|wallpaper| wallpaper.frames.iter().map(|frame| frame.delay).sum::<u32>()).sum());
+    loop {
+        for (i, screen) in screens.screen_info.iter().enumerate() {
+            let len = wallpapers.len();
+            let stack = &mut wallpapers[i%len];
+            let delay = stack.frames[stack.index].delay;
+            if count % delay == 0 {
+                let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
+                let texture = &stack.frames[stack.index].texture;
+                // then move to this
+                canvas.copy(texture, None, rect).unwrap();
+                canvas.present();
+                stack.index = (stack.index + 1) % stack.count;
             }
-            count = (count + 1) % max;
-            thread::sleep(Duration::from_millis(1));
         }
-
-
+        count = (count + 1) % max;
+        thread::sleep(Duration::from_millis(1));
     }
 }
 
