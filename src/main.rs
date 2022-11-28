@@ -1,24 +1,22 @@
 use std::io::Write;
+use std::ffi::c_void;
+use std::fs::File;
+use std::{thread, time::Duration};
+use std::env;
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::*;
+use x11rb::protocol::xinerama::query_screens;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 use x11rb::errors::{ReplyOrIdError, ConnectionError};
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::cookie::VoidCookie;
 use image::codecs::gif::GifDecoder;
 use image::AnimationDecoder;
-use std::ffi::c_void;
-use std::fs::File;
-use std::{thread, time::Duration};
 use sdl2::video::Window;
-use sdl2::render::Canvas;
+use sdl2::render::{Canvas, Texture};
 use sdl2::image::LoadTexture;
-use sdl2_sys::SDL_CreateWindowFrom;
-use std::env::temp_dir;
-use std::env;
-use sdl2::render::Texture;
 use sdl2::rect::Rect;
-use x11rb::protocol::xinerama::query_screens;
+use sdl2_sys::SDL_CreateWindowFrom;
 
 
 struct Frame<'a> {
@@ -70,7 +68,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let mut stack = Vec::new();
             for (i, result) in frames.enumerate() {
-                let tmp_frame = format!("{}/fig_frame.bmp", temp_dir().to_str().unwrap());
+                let tmp_frame = format!("{}/fig_frame.bmp", env::temp_dir().to_str().unwrap());
 
                 print!("\rLoading frame {} ", i);
                 std::io::stdout().flush().unwrap();
@@ -98,7 +96,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
                     let texture = &stack.frames[stack.index].texture;
                     // then move to this
-                    canvas.copy(&texture, None, rect).unwrap();
+                    canvas.copy(texture, None, rect).unwrap();
                     canvas.present();
                     stack.index = (stack.index + 1) % stack.count;
                 }
