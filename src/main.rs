@@ -157,9 +157,9 @@ fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::
         print!("\rwidth {} ", width);
         print!("height {} ", buffer.height());
         print!("length {} ", pixels.len());
-        let pitch = pixels.len() / width;
+        let pitch = pixels.len() / (width*4);
         print!("pitch {} ", pitch);
-        raw_stack.push(RawFrame{ index, delay, pixels, pitch: width });
+        raw_stack.push(RawFrame{ index, delay, pixels, pitch: 4*2160 });
         print!("Loading frame {} ", i);
         std::io::stdout().flush()?;
     }
@@ -171,7 +171,7 @@ fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::
 
 fn load_frame(buffer: &RgbaImage) -> Result<Vec::<u8>, Box<dyn std::error::Error>> {
     let mut buf = Cursor::new(Vec::new());
-    buffer.write_to(&mut buf, ImageOutputFormat::Gif)?;
+    buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
     //should also return buffer.width, I think that's the pitch = len / width
     Ok(buf.into_inner())
 }
