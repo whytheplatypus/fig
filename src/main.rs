@@ -11,19 +11,22 @@ use x11rb::errors::{ReplyOrIdError, ConnectionError};
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::cookie::VoidCookie;
 use image::codecs::gif::GifDecoder;
+use image::RgbaImage;
 use image::AnimationDecoder;
 use image::ImageOutputFormat;
 use sdl2::video::Window;
-use sdl2::render::{Canvas, Texture};
+use sdl2::render::Canvas;
 use sdl2::image::LoadTexture;
 use sdl2::rect::Rect;
 use sdl2_sys::SDL_CreateWindowFrom;
 
 
+/*
 struct Frame<'a> {
     delay: u32,
     texture: Texture<'a>,
 }
+*/
 
 #[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RawFrame {
@@ -32,20 +35,20 @@ struct RawFrame {
     pixels: Vec::<u8>,
 }
 
-struct Stack<'a> {
+struct Stack {
     count: usize,
     index: usize,
-    frames: Vec::<Frame<'a>>,
+    frames: Vec::<RawFrame>,
 }
 
-impl Stack<'_> {
-    fn next(&mut self) -> &Frame {
-        let frame = &self.frames[self.index];
+impl Stack {
+    fn next(&mut self) -> &mut RawFrame {
+        let frame = &mut self.frames[self.index];
         self.index = (self.index + 1) % self.count;
         frame
     }
 
-    fn peek(&self) -> &Frame {
+    fn peek(&self) -> &RawFrame {
         &self.frames[self.index]
     }
 
@@ -59,6 +62,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     let gifs = dbg!(&args[1..args.len()]);
+    let mut wallpapers = {
+        let mut wallpapers = Vec::new();
+
+        for gif in gifs {
+            let stack = load_raw_frames(gif)?;
+            wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
+        }
+        wallpapers
+    };
 
     let (conn, screen_num) = x11rb::connect(None).unwrap();
 
@@ -68,51 +80,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     set_desktop_atoms(&conn, win_id)?;
     show_desktop(&conn, win_id)?;
 
-
     println!("Created {:?}", win_id);
 
     let mut canvas = create_canvas(win_id)?;
     let texture_creator = canvas.texture_creator();
 
-    let mut wallpapers = Vec::new();
+    let screen_rects = {
+        let mut screen_rects = Vec::new();
+        for screen in screens.screen_info {
+            let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
+            screen_rects.push(rect);
+        }
+        screen_rects
+    };
 
-    for gif in gifs {
-        let raw_stack = load_raw_frames(gif)?;
-        let stack = load_textures(&texture_creator, raw_stack)?;
-        wallpapers.push(Stack{ count: stack.len(), index: 0, frames: stack});
-    }
-
-    let mut screen_rects = Vec::new();
-    for screen in screens.screen_info {
-        let rect = Rect::new(screen.x_org as i32, screen.y_org as i32, screen.width as u32, screen.height as u32);
-        screen_rects.push(rect);
-    }
-
+    let len = wallpapers.len();
     let mut count: u32 = 0;
     let max: u32 = dbg!(wallpapers.iter().map(|wallpaper| wallpaper.total_time()).sum());
     loop {
         for (i, rect) in screen_rects.iter().enumerate() {
-            let len = wallpapers.len();
             let stack = &mut wallpapers[i%len];
             let delay = stack.peek().delay;
             if count % delay == 0 {
-                let texture = &stack.next().texture;
-                canvas.copy(texture, None, *rect).unwrap();
+                let frame = stack.next();
+                let texture = texture_creator.load_texture_bytes(&frame.pixels)?;
+                canvas.copy(&texture, None, *rect).unwrap();
                 canvas.present();
+                drop(texture);
             }
         }
         count = (count + 1) % max;
         thread::sleep(Duration::from_millis(1));
     }
-}
-
-fn load_textures(texture_creator: &impl LoadTexture, raw_stack: Vec::<RawFrame>) -> Result<Vec::<Frame>, Box<dyn std::error::Error>> {
-    let mut stack = Vec::new();
-    for frame in raw_stack {
-        let texture = texture_creator.load_texture_bytes(&frame.pixels)?;
-        stack.push(Frame{ delay: frame.delay, texture });
-    }
-    Ok(stack)
 }
 
 fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::Error>> {
@@ -121,14 +120,13 @@ fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::
     let frames = decoder.into_frames();
 
     let mut raw_stack = Vec::new();
-    for (i, result) in frames.enumerate() {
-        print!("\rLoading frame {} ", i);
-        std::io::stdout().flush()?;
-        let index = i;
+    for (index, result) in frames.enumerate() {
         let frame = result?;
         let (delay, _) = frame.delay().numer_denom_ms();
-        let pixels = load_frame(frame)?;
+        let pixels = load_frame(frame.buffer())?;
         raw_stack.push(RawFrame{ index, delay, pixels });
+        print!("\rLoading frame {} ", index);
+        std::io::stdout().flush()?;
     }
 
 
@@ -136,8 +134,7 @@ fn load_raw_frames(gif: &String) -> Result<Vec::<RawFrame>, Box<dyn std::error::
     Ok(raw_stack)
 }
 
-fn load_frame(frame: image::Frame) -> Result<Vec::<u8>, Box<dyn std::error::Error>> {
-    let buffer = frame.into_buffer();
+fn load_frame(buffer: &RgbaImage) -> Result<Vec::<u8>, Box<dyn std::error::Error>> {
     let mut buf = Cursor::new(Vec::new());
     buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
     Ok(buf.into_inner())
