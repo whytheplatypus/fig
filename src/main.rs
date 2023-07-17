@@ -3,6 +3,7 @@ use image::AnimationDecoder;
 use image::ImageDecoder;
 use image::ImageOutputFormat;
 use image::RgbaImage;
+use image::Frames
 use sdl2::image::LoadTexture;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
@@ -64,12 +65,46 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     let gifs = dbg!(&args[1..args.len()]);
-    let raw_wallpapers = {
+    let wallpapers = {
+        let sdl_context = sdl2::init()?;
+
         let mut wallpapers = Vec::new();
 
         for gif in gifs {
-            let stack = load_raw_frames(gif)?;
-            wallpapers.push(stack);
+            let (width, height, rawFrames) = load_raw_frames(gif)?;
+            let surface = sdl2::surface::Surface::new(
+                width,
+                height,
+                sdl2::pixels::PixelFormatEnum::ARGB8888,
+            )?;
+            let canvas = &mut surface.into_canvas()?;
+            let texture_creator = canvas.texture_creator();
+            let mut frames = Vec::new();
+            for (index, result) in rawFrames.enumerate() {
+                let frame = result.unwrap();
+                let pixels = load_frame(frame.buffer()).unwrap();
+                // --- requires pixels and canvas
+                let texture = texture_creator.load_texture_bytes(&pixels[..])?;
+                canvas.copy(&texture, None, None).unwrap();
+                canvas.present();
+                let texturePixels =
+                    canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::ARGB8888)?;
+                // --
+                let (delay, _) = frame.delay().numer_denom_ms();
+                frames.push(RawFrame {
+                    index,
+                    delay,
+                    pixels: texturePixels,
+                });
+            }
+            wallpapers.push(Stack {
+                count: frames.len(),
+                index: 0,
+                frames,
+                pitch: usize::try_from(canvas.surface().pitch()).unwrap(),
+                width,
+                height,
+            });
         }
         wallpapers
     };
@@ -91,55 +126,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_rects
     };
 
-    let mut wallpapers = {
-        let mut wallpapers = Vec::new();
-        let sdl_context = sdl2::init()?;
-        for gif in &raw_wallpapers {
-            let (width, height, raw_stack) = gif;
-            let surface = sdl2::surface::Surface::new(
-                *width,
-                *height,
-                sdl2::pixels::PixelFormatEnum::ARGB8888,
-            )?;
-            let canvas = &mut surface.into_canvas()?;
-            let texture_creator = canvas.texture_creator();
-
-            let frames = {
-                let mut frames = Vec::new();
-                for frame in raw_stack {
-                    let texture = texture_creator.load_texture_bytes(&frame.pixels)?;
-                    canvas.copy(&texture, None, None).unwrap();
-                    canvas.present();
-                    let pixels =
-                        canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::ARGB8888)?;
-                    frames.push(RawFrame {
-                        index: frame.index,
-                        delay: frame.delay,
-                        pixels,
-                    });
-                    drop(texture);
-                }
-                frames
-            };
-            dbg!(canvas.surface().pitch());
-
-            wallpapers.push(Stack {
-                count: frames.len(),
-                index: 0,
-                frames: frames,
-                pitch: usize::try_from(canvas.surface().pitch()).unwrap(),
-                width: *width,
-                height: *height,
-            });
-            drop(canvas);
-            drop(texture_creator);
-        }
-        drop(raw_wallpapers);
-        //then close
-        drop(sdl_context);
-        wallpapers
-    };
-
     let win_id = create_desktop(&conn, screen_num).unwrap();
     set_desktop_atoms(&conn, win_id)?;
     show_desktop(&conn, win_id)?;
@@ -156,7 +142,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let texture = texture_creator
                 .create_texture(
                     None,
-                    TextureAccess::Static,
+                    TextureAccess::Streaming,
                     wallpaper.width,
                     wallpaper.height,
                 )
@@ -174,7 +160,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .sum());
     loop {
         for (i, rect) in screen_rects.iter().enumerate() {
-            let stack = &mut wallpapers[i % len];
+            let stack = wallpapers[i % len];
             let delay = stack.peek().delay;
             if count % delay == 0 {
                 let pitch = stack.pitch;
@@ -190,30 +176,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
+fn load_raw_frames(gif: &String) -> Result<(u32, u32, Frames), Box<dyn std::error::Error>> {
     let file_in = File::open(gif)?;
     let decoder = GifDecoder::new(file_in)?;
 
     let (width, height) = dbg!(decoder.dimensions());
 
     let frames = decoder.into_frames();
-
-    let mut raw_stack = Vec::new();
-    for (index, result) in frames.enumerate() {
-        let frame = result?;
-        let (delay, _) = frame.delay().numer_denom_ms();
-        let pixels = load_frame(frame.buffer())?;
-        raw_stack.push(RawFrame {
-            index,
-            delay,
-            pixels,
-        });
-        print!("\rLoading frame {} ", index);
-        std::io::stdout().flush()?;
-    }
-
-    raw_stack.sort();
-    Ok((width, height, raw_stack))
+    Ok((width, height, frames))
 }
 
 fn load_frame(buffer: &RgbaImage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
