@@ -31,7 +31,6 @@ struct Frame<'a> {
 */
 
 struct RawFrame {
-    index: usize,
     delay: u32,
     rect: Rect,
     pitch: usize,
@@ -157,7 +156,6 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     decoder.set_color_output(gif::ColorOutput::RGBA);
     let mut decoder = decoder.read_info(file_in).unwrap();
     let mut frames = Vec::new();
-    let mut index = 0;
     while let Some(frame) = decoder.read_next_frame().unwrap() {
         // print the line_length
         let delay = frame.delay as u32;
@@ -171,13 +169,11 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
         let pixels = frame.buffer.to_vec();
         let pitch = frame.width as usize * 4;
         frames.push(RawFrame {
-            index,
             delay,
             rect,
             pixels,
             pitch,
         });
-        index += 1;
     }
 
     let width = decoder.width();
