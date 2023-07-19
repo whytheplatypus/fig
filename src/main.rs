@@ -1,19 +1,11 @@
-use image::codecs::gif::GifDecoder;
-use image::AnimationDecoder;
-use image::ImageDecoder;
-use image::ImageOutputFormat;
-use image::RgbaImage;
-use image::Frames;
-use sdl2::image::LoadTexture;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
-use sdl2::pixels::{Color, PixelFormatEnum};
+use sdl2::pixels::PixelFormatEnum;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{Cursor};
 use std::{thread, time::Duration};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
@@ -180,12 +172,6 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     let height = decoder.height();
 
     Ok((width as u32, height as u32, frames))
-}
-
-fn load_frame(buffer: &RgbaImage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut buf = Cursor::new(Vec::new());
-    buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
-    Ok(buf.into_inner())
 }
 
 fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Error>> {
