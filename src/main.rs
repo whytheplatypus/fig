@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for wallpaper in &wallpapers {
             let mut texture = texture_creator
                 .create_texture(
-                    PixelFormatEnum::RGBA8888,
+                    PixelFormatEnum::ABGR8888,
                     TextureAccess::Streaming,
                     wallpaper.width,
                     wallpaper.height,
@@ -145,7 +145,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 canvas.present();
             }
         }
-        break Ok(());
         count = (count + 1) % max;
         thread::sleep(Duration::from_millis(10));
     }
