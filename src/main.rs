@@ -1,17 +1,11 @@
-use image::codecs::gif::GifDecoder;
-use image::AnimationDecoder;
-use image::ImageDecoder;
-use image::ImageOutputFormat;
-use image::RgbaImage;
-use sdl2::image::LoadTexture;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
+use sdl2::pixels::PixelFormatEnum;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
-use std::io::{Cursor, Write};
 use std::{thread, time::Duration};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
@@ -28,10 +22,10 @@ struct Frame<'a> {
 }
 */
 
-#[derive(Debug, Eq, Ord, PartialEq, PartialOrd)]
 struct RawFrame {
-    index: usize,
     delay: u32,
+    rect: Rect,
+    pitch: usize,
     pixels: Vec<u8>,
 }
 
@@ -39,7 +33,6 @@ struct Stack {
     count: usize,
     index: usize,
     frames: Vec<RawFrame>,
-    pitch: usize,
     width: u32,
     height: u32,
 }
@@ -64,12 +57,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     let gifs = dbg!(&args[1..args.len()]);
-    let raw_wallpapers = {
+    let mut wallpapers = {
+
         let mut wallpapers = Vec::new();
 
         for gif in gifs {
-            let stack = load_raw_frames(gif)?;
-            wallpapers.push(stack);
+            let (width, height, frames) = load_raw_frames(gif)?;
+            wallpapers.push(Stack {
+                count: frames.len(),
+                index: 0,
+                frames,
+                width,
+                height,
+            });
         }
         wallpapers
     };
@@ -91,55 +91,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_rects
     };
 
-    let mut wallpapers = {
-        let mut wallpapers = Vec::new();
-        let sdl_context = sdl2::init()?;
-        for gif in &raw_wallpapers {
-            let (width, height, raw_stack) = gif;
-            let surface = sdl2::surface::Surface::new(
-                *width,
-                *height,
-                sdl2::pixels::PixelFormatEnum::ARGB8888,
-            )?;
-            let canvas = &mut surface.into_canvas()?;
-            let texture_creator = canvas.texture_creator();
-
-            let frames = {
-                let mut frames = Vec::new();
-                for frame in raw_stack {
-                    let texture = texture_creator.load_texture_bytes(&frame.pixels)?;
-                    canvas.copy(&texture, None, None).unwrap();
-                    canvas.present();
-                    let pixels =
-                        canvas.read_pixels(None, sdl2::pixels::PixelFormatEnum::ARGB8888)?;
-                    frames.push(RawFrame {
-                        index: frame.index,
-                        delay: frame.delay,
-                        pixels,
-                    });
-                    drop(texture);
-                }
-                frames
-            };
-            dbg!(canvas.surface().pitch());
-
-            wallpapers.push(Stack {
-                count: frames.len(),
-                index: 0,
-                frames: frames,
-                pitch: usize::try_from(canvas.surface().pitch()).unwrap(),
-                width: *width,
-                height: *height,
-            });
-            drop(canvas);
-            drop(texture_creator);
-        }
-        drop(raw_wallpapers);
-        //then close
-        drop(sdl_context);
-        wallpapers
-    };
-
     let win_id = create_desktop(&conn, screen_num).unwrap();
     set_desktop_atoms(&conn, win_id)?;
     show_desktop(&conn, win_id)?;
@@ -153,14 +104,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut textures = Vec::new();
         // this would have to be gif rects, not screen rects, i think... this was probably part of the old problem
         for wallpaper in &wallpapers {
-            let texture = texture_creator
+            let mut texture = texture_creator
                 .create_texture(
-                    None,
-                    TextureAccess::Static,
+                    PixelFormatEnum::ABGR8888,
+                    TextureAccess::Streaming,
                     wallpaper.width,
                     wallpaper.height,
                 )
                 .unwrap();
+            texture.set_blend_mode(sdl2::render::BlendMode::Blend);
             textures.push(texture);
         }
         textures
@@ -177,49 +129,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let stack = &mut wallpapers[i % len];
             let delay = stack.peek().delay;
             if count % delay == 0 {
-                let pitch = stack.pitch;
                 let frame = stack.next();
                 let texture = &mut textures[i % len];
-                texture.update(None, &frame.pixels, pitch).unwrap();
+                texture.update(frame.rect, &frame.pixels, frame.pitch).unwrap();
                 canvas.copy(&texture, None, *rect).unwrap();
                 canvas.present();
             }
         }
         count = (count + 1) % max;
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
     let file_in = File::open(gif)?;
-    let decoder = GifDecoder::new(file_in)?;
-
-    let (width, height) = dbg!(decoder.dimensions());
-
-    let frames = decoder.into_frames();
-
-    let mut raw_stack = Vec::new();
-    for (index, result) in frames.enumerate() {
-        let frame = result?;
-        let (delay, _) = frame.delay().numer_denom_ms();
-        let pixels = load_frame(frame.buffer())?;
-        raw_stack.push(RawFrame {
-            index,
+    let mut decoder = gif::DecodeOptions::new();
+    // Configure the decoder such that it will expand the image to RGBA.
+    decoder.set_color_output(gif::ColorOutput::RGBA);
+    let mut decoder = decoder.read_info(file_in).unwrap();
+    let mut frames = Vec::new();
+    while let Some(frame) = decoder.read_next_frame().unwrap() {
+        // print the line_length
+        let delay = frame.delay as u32;
+        let rect = Rect::new(
+            frame.left as i32,
+            frame.top as i32,
+            frame.width as u32,
+            frame.height as u32,
+        );
+        // Process every frame
+        let pixels = frame.buffer.to_vec();
+        let pitch = frame.width as usize * 4;
+        frames.push(RawFrame {
             delay,
+            rect,
             pixels,
+            pitch,
         });
-        print!("\rLoading frame {} ", index);
-        std::io::stdout().flush()?;
     }
 
-    raw_stack.sort();
-    Ok((width, height, raw_stack))
-}
+    let width = decoder.width();
+    let height = decoder.height();
 
-fn load_frame(buffer: &RgbaImage) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut buf = Cursor::new(Vec::new());
-    buffer.write_to(&mut buf, ImageOutputFormat::Bmp)?;
-    Ok(buf.into_inner())
+    Ok((width as u32, height as u32, frames))
 }
 
 fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Error>> {
