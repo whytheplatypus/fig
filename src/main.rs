@@ -74,7 +74,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (width, height, frames) = load_raw_frames(gif)?;
             wallpapers.push(Stack {
                 count: frames.len(),
-                index: 1,
+                index: 0,
                 frames,
                 width,
                 height,
