@@ -17,6 +17,10 @@ use x11rb::COPY_DEPTH_FROM_PARENT;
 
 struct RawFrame {
     delay: u32,
+    sections: Vec<Section>,
+}
+
+struct Section {
     rect: Rect,
     pitch: usize,
     pixels: Vec<u8>,
@@ -25,6 +29,7 @@ struct RawFrame {
 struct Stack {
     count: usize,
     index: usize,
+    // what if we split these up?
     frames: Vec<RawFrame>,
     width: u32,
     height: u32,
@@ -121,7 +126,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if count % delay == 0 {
                 let frame = stack.next();
                 let texture = &mut textures[i % len];
-                texture.update(frame.rect, &frame.pixels, frame.pitch)?;
+                for section in &frame.sections {
+                //    texture.update(section.rect, &section.pixels, section.pitch);
+                    texture.with_lock(section.rect, |buffer: &mut [u8], pitch: usize| {
+                        for (i, pixel) in section.pixels.iter().enumerate() {
+                            buffer[i] = *pixel;
+                        }
+                    })?;
+                }
                 canvas.copy(&texture, None, *rect)?;
                 canvas.present();
             }
@@ -138,23 +150,42 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     decoder.set_color_output(gif::ColorOutput::RGBA);
     let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
+    let mut previous_pixels: Option<Vec<u8>> = None;
     while let Some(frame) = decoder.read_next_frame()? {
         // print the line_length
         let delay = frame.delay as u32;
-        let rect = Rect::new(
-            frame.left as i32,
-            frame.top as i32,
-            frame.width as u32,
-            frame.height as u32,
-        );
         // Process every frame
         let pixels = frame.buffer.to_vec();
         let pitch = frame.width as usize * 4;
+        let mut squares = Vec::new();
+
+        for y in 0..frame.height {
+            let start = y as usize * pitch;
+            let end = (y as usize + 1) * pitch;
+            if let Some(previous_pixels) = &previous_pixels {
+                if end < previous_pixels.len() {
+                    if &pixels[start..end] == &previous_pixels[start..end] {
+                        continue;
+                    }
+                }
+            }
+            let pixel_row = &pixels[start..end];
+            squares.push(Section {
+                rect: Rect::new(
+                    frame.left as i32, 
+                    frame.top as i32 + y as i32, 
+                    frame.width as u32,
+                    1
+                ),
+                pitch,
+                pixels: pixel_row.to_vec(),
+            });
+        }
+
+        previous_pixels = Some(pixels);
         frames.push(RawFrame {
             delay,
-            rect,
-            pixels,
-            pitch,
+            sections: squares,
         });
     }
 
