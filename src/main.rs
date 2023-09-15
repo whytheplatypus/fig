@@ -1,7 +1,7 @@
+use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
-use sdl2::pixels::PixelFormatEnum;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
 use std::ffi::c_void;
@@ -9,18 +9,11 @@ use std::fs::File;
 use std::{thread, time::Duration};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
-use x11rb::errors::{ConnectionError, ReplyOrIdError};
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xinerama::query_screens;
 use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
-
-/*
-struct Frame<'a> {
-    delay: u32,
-    texture: Texture<'a>,
-}
-*/
 
 struct RawFrame {
     delay: u32,
@@ -58,7 +51,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let gifs = dbg!(&args[1..args.len()]);
     let mut wallpapers = {
-
         let mut wallpapers = Vec::new();
 
         for gif in gifs {
@@ -74,9 +66,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wallpapers
     };
 
-    let (conn, screen_num) = x11rb::connect(None).unwrap();
+    let (conn, screen_num) = x11rb::connect(None)?;
 
-    let screens = dbg!(query_screens(&conn).unwrap().reply().unwrap());
+    let screens = dbg!(query_screens(&conn)?.reply()?);
     let screen_rects = {
         let mut screen_rects = Vec::new();
         for screen in screens.screen_info {
@@ -91,7 +83,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_rects
     };
 
-    let win_id = create_desktop(&conn, screen_num).unwrap();
+    let win_id = create_desktop(&conn, screen_num)?;
     set_desktop_atoms(&conn, win_id)?;
     show_desktop(&conn, win_id)?;
 
@@ -104,14 +96,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut textures = Vec::new();
         // this would have to be gif rects, not screen rects, i think... this was probably part of the old problem
         for wallpaper in &wallpapers {
-            let mut texture = texture_creator
-                .create_texture(
-                    PixelFormatEnum::ABGR8888,
-                    TextureAccess::Streaming,
-                    wallpaper.width,
-                    wallpaper.height,
-                )
-                .unwrap();
+            let mut texture = texture_creator.create_texture(
+                PixelFormatEnum::ABGR8888,
+                TextureAccess::Streaming,
+                wallpaper.width,
+                wallpaper.height,
+            )?;
             texture.set_blend_mode(sdl2::render::BlendMode::Blend);
             textures.push(texture);
         }
@@ -131,8 +121,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if count % delay == 0 {
                 let frame = stack.next();
                 let texture = &mut textures[i % len];
-                texture.update(frame.rect, &frame.pixels, frame.pitch).unwrap();
-                canvas.copy(&texture, None, *rect).unwrap();
+                texture.update(frame.rect, &frame.pixels, frame.pitch)?;
+                canvas.copy(&texture, None, *rect)?;
                 canvas.present();
             }
         }
@@ -146,9 +136,9 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     let mut decoder = gif::DecodeOptions::new();
     // Configure the decoder such that it will expand the image to RGBA.
     decoder.set_color_output(gif::ColorOutput::RGBA);
-    let mut decoder = decoder.read_info(file_in).unwrap();
+    let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
-    while let Some(frame) = decoder.read_next_frame().unwrap() {
+    while let Some(frame) = decoder.read_next_frame()? {
         // print the line_length
         let delay = frame.delay as u32;
         let rect = Rect::new(
@@ -191,30 +181,55 @@ fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Erro
     Ok(canvas)
 }
 
+#[derive(Debug)]
+enum X11Error {
+    ConnectionError(ConnectionError),
+    ReplyError(ReplyError),
+}
+
+impl std::error::Error for X11Error {}
+
+impl std::fmt::Display for X11Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            X11Error::ConnectionError(e) => write!(f, "ConnectionError: {}", e),
+            X11Error::ReplyError(e) => write!(f, "ReplyError: {}", e),
+        }
+    }
+}
+
+impl From<ConnectionError> for X11Error {
+    fn from(e: ConnectionError) -> Self {
+        X11Error::ConnectionError(e)
+    }
+}
+
+impl From<ReplyError> for X11Error {
+    fn from(e: ReplyError) -> Self {
+        X11Error::ReplyError(e)
+    }
+}
+
 fn set_desktop_atoms(
     conn: &impl Connection,
     win_id: u32,
-) -> Result<VoidCookie<'_, impl Connection>, ConnectionError> {
+) -> Result<VoidCookie<'_, impl Connection>, X11Error> {
     let atom_wm_type = conn
-        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
-        .unwrap()
-        .reply()
-        .unwrap()
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")?
+        .reply()?
         .atom;
     let atom_wm_desktop = conn
-        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")
-        .unwrap()
-        .reply()
-        .unwrap()
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")?
+        .reply()?
         .atom;
 
-    conn.change_property32(
+    Ok(conn.change_property32(
         PropMode::REPLACE,
         win_id,
         atom_wm_type,
         AtomEnum::ATOM,
         &[atom_wm_desktop],
-    )
+    )?)
 }
 
 fn show_desktop(conn: &impl Connection, win_id: u32) -> Result<(), ConnectionError> {
