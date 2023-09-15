@@ -161,7 +161,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
 
         for y in 0..frame.height {
             let start = y as usize * pitch;
-            let end = (y as usize + 1) * pitch;
+            let end = start + pitch;
             if let Some(previous_pixels) = &previous_pixels {
                 if end < previous_pixels.len() {
                     if &pixels[start..end] == &previous_pixels[start..end] {
