@@ -15,15 +15,15 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-struct RawFrame {
-    delay: u32,
-    sections: Vec<Section>,
-}
-
-struct Section {
+struct Square {
     rect: Rect,
     pitch: usize,
     pixels: Vec<u8>,
+}
+
+struct RawFrame {
+    delay: u32,
+    squares: Vec<Square>,
 }
 
 struct Stack {
@@ -126,13 +126,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if count % delay == 0 {
                 let frame = stack.next();
                 let texture = &mut textures[i % len];
-                for section in &frame.sections {
-                //    texture.update(section.rect, &section.pixels, section.pitch);
-                    texture.with_lock(section.rect, |buffer: &mut [u8], pitch: usize| {
-                        for (i, pixel) in section.pixels.iter().enumerate() {
-                            buffer[i] = *pixel;
-                        }
-                    })?;
+                for square in &frame.squares {
+                    texture.update(square.rect, &square.pixels, square.pitch)?;
                 }
                 canvas.copy(&texture, None, *rect)?;
                 canvas.present();
@@ -143,6 +138,50 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn chunck_frame(
+    top: i32,
+    left: i32,
+    width: u32,
+    height: u32,
+    pitch: usize,
+    raw_pixels: &Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut y = top as usize;
+    let local_pitch = width as usize * 4;
+    let mut pixel_square = Vec::new();
+    while y < (height + top as u32) as usize {
+        let start = y * pitch + left as usize * 4;
+        if start > raw_pixels.len() {
+            return Err("bad start value".into());
+        }
+        let end = start + local_pitch;
+        if end > raw_pixels.len() {
+            return Err("bad end value".into());
+        }
+        let pixel_row = &raw_pixels[start..end];
+        pixel_square.extend_from_slice(pixel_row);
+        y += 1;
+    }
+    if pixel_square.len() % (width * 4) as usize != 0 || pixel_square.len() == 0 {
+        return Err("bad pixel square".into());
+    }
+    return Ok(pixel_square);
+}
+
+fn check_square(frames: &Vec<RawFrame>, square: &Square) -> bool {
+    for previoud_frame in frames {
+        for previous_square in &previoud_frame.squares {
+            if previous_square.rect == square.rect {
+                if previous_square.pixels == square.pixels {
+                    return true;
+                }
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
     let file_in = File::open(gif)?;
     let mut decoder = gif::DecodeOptions::new();
@@ -150,7 +189,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     decoder.set_color_output(gif::ColorOutput::RGBA);
     let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
-    let mut previous_pixels: Option<Vec<u8>> = None;
+    let dimension = 30;
     while let Some(frame) = decoder.read_next_frame()? {
         // print the line_length
         let delay = frame.delay as u32;
@@ -159,34 +198,54 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
         let pitch = frame.width as usize * 4;
         let mut squares = Vec::new();
 
-        for y in 0..frame.height {
-            let start = y as usize * pitch;
-            let end = start + pitch;
-            if let Some(previous_pixels) = &previous_pixels {
-                if end < previous_pixels.len() {
-                    if &pixels[start..end] == &previous_pixels[start..end] {
+        for y in (0..frame.height).step_by(dimension) {
+            let height = if y + dimension as u16 > frame.height {
+                frame.height - y
+            } else {
+                dimension as u16
+            };
+            for x in (0..frame.width).step_by(dimension) {
+                let width = if x + dimension as u16 > frame.width {
+                    frame.width - x
+                } else {
+                    dimension as u16
+                };
+                let rect = Rect::new(
+                    (frame.left + x) as i32,
+                    (frame.top + y) as i32,
+                    width as u32,
+                    height as u32,
+                );
+                //let pitch = frame.width as usize * 4;
+                let chunk = chunck_frame(
+                    y as i32,
+                    x as i32,
+                    width as u32,
+                    height as u32,
+                    pitch,
+                    &pixels,
+                );
+                match chunk {
+                    Ok(chunk) => {
+                        let square = Square {
+                            rect,
+                            pitch: width as usize * 4,
+                            pixels: chunk,
+                        };
+                        if check_square(&frames, &square) {
+                            continue;
+                        }
+                        squares.push(square);
+                    }
+                    Err(e) => {
+                        println!("error: {}", dbg!(e));
                         continue;
                     }
                 }
             }
-            let pixel_row = &pixels[start..end];
-            squares.push(Section {
-                rect: Rect::new(
-                    frame.left as i32, 
-                    frame.top as i32 + y as i32, 
-                    frame.width as u32,
-                    1
-                ),
-                pitch,
-                pixels: pixel_row.to_vec(),
-            });
         }
 
-        previous_pixels = Some(pixels);
-        frames.push(RawFrame {
-            delay,
-            sections: squares,
-        });
+        frames.push(RawFrame { delay, squares });
     }
 
     let width = decoder.width();
