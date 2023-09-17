@@ -51,6 +51,8 @@ impl Stack {
     }
 }
 
+const DIMENSION: usize = 30;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
@@ -189,7 +191,6 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     decoder.set_color_output(gif::ColorOutput::RGBA);
     let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
-    let dimension = 30;
     while let Some(frame) = decoder.read_next_frame()? {
         // print the line_length
         let delay = frame.delay as u32;
@@ -198,17 +199,17 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
         let pitch = frame.width as usize * 4;
         let mut squares = Vec::new();
 
-        for y in (0..frame.height).step_by(dimension) {
-            let height = if y + dimension as u16 > frame.height {
+        for y in (0..frame.height).step_by(DIMENSION) {
+            let height = if y + DIMENSION as u16 > frame.height {
                 frame.height - y
             } else {
-                dimension as u16
+                DIMENSION as u16
             };
-            for x in (0..frame.width).step_by(dimension) {
-                let width = if x + dimension as u16 > frame.width {
+            for x in (0..frame.width).step_by(DIMENSION) {
+                let width = if x + DIMENSION as u16 > frame.width {
                     frame.width - x
                 } else {
-                    dimension as u16
+                    DIMENSION as u16
                 };
                 let rect = Rect::new(
                     (frame.left + x) as i32,
