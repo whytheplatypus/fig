@@ -171,12 +171,16 @@ fn chunck_frame(
 }
 
 fn check_square(frames: &Vec<RawFrame>, square: &Square) -> bool {
-    for previoud_frame in frames {
+    for previoud_frame in frames.iter().rev() {
         for previous_square in &previoud_frame.squares {
             if previous_square.rect == square.rect {
                 if previous_square.pixels == square.pixels {
                     return true;
                 }
+                return false;
+            }
+            // if the previous rect intersects with the current rect return false
+            if previous_square.rect.has_intersection(square.rect) {
                 return false;
             }
         }
