@@ -51,7 +51,7 @@ impl Stack {
     }
 }
 
-const DIMENSION: usize = 30;
+const DIMENSION: usize = 32;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -193,6 +193,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     let mut decoder = gif::DecodeOptions::new();
     // Configure the decoder such that it will expand the image to RGBA.
     decoder.set_color_output(gif::ColorOutput::RGBA);
+    let mut dup_count = 0;
     let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
     while let Some(frame) = decoder.read_next_frame()? {
@@ -238,6 +239,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
                             pixels: chunk,
                         };
                         if check_square(&frames, &square) {
+                            dup_count += 1;
                             continue;
                         }
                         squares.push(square);
@@ -252,6 +254,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
 
         frames.push(RawFrame { delay, squares });
     }
+    println!("dup_count: {}", dup_count);
 
     let width = decoder.width();
     let height = decoder.height();
