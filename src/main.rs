@@ -145,13 +145,14 @@ fn chunk_frame(
     width: usize,
     height: usize,
     pitch: usize,
+    bytes_per_pixel: usize,
     raw_pixels: &Vec<u8>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
     let mut y = top;
-    let local_pitch = width * 4;
+    let local_pitch = width * bytes_per_pixel;
     let mut pixel_square = Vec::new();
     while y < height + top {
-        let start = y * pitch + left * 4;
+        let start = y * pitch + left * bytes_per_pixel;
         if start > raw_pixels.len() {
             return Err("bad start value".into());
         }
@@ -163,7 +164,7 @@ fn chunk_frame(
         pixel_square.extend_from_slice(pixel_row);
         y += 1;
     }
-    if pixel_square.len() % (width * 4) != 0 || pixel_square.len() == 0 {
+    if pixel_square.len() % (width * bytes_per_pixel) != 0 || pixel_square.len() == 0 {
         return Err("bad pixel square".into());
     }
     return Ok(pixel_square);
@@ -192,6 +193,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
     let mut decoder = gif::DecodeOptions::new();
     // Configure the decoder such that it will expand the image to RGBA.
     decoder.set_color_output(gif::ColorOutput::RGBA);
+    let bytes_per_pixel = 4;
     let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
     while let Some(frame) = decoder.read_next_frame()? {
@@ -199,7 +201,7 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
         let delay = frame.delay as u32;
         // Process every frame
         let pixels = frame.buffer.to_vec();
-        let pitch = frame.width as usize * 4;
+        let pitch = frame.width as usize * bytes_per_pixel;
         let mut squares = Vec::new();
 
         for y in (0..frame.height).step_by(DIMENSION) {
@@ -220,20 +222,20 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
                     width as u32,
                     height as u32,
                 );
-                //let pitch = frame.width as usize * 4;
                 let chunk = chunk_frame(
                     y.into(),
                     x.into(),
                     width.into(),
                     height.into(),
                     pitch,
+                    bytes_per_pixel,
                     &pixels,
                 );
                 match chunk {
                     Ok(chunk) => {
                         let square = Square {
                             rect,
-                            pitch: width as usize * 4,
+                            pitch: width as usize * bytes_per_pixel,
                             pixels: chunk,
                         };
                         if check_square(&frames, &square) {
