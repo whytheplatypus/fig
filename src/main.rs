@@ -139,7 +139,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-fn chunck_frame(
+fn chunk_frame(
     top: usize,
     left: usize,
     width: usize,
@@ -222,11 +222,11 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
                     height as u32,
                 );
                 //let pitch = frame.width as usize * 4;
-                let chunk = chunck_frame(
+                let chunk = chunk_frame(
                     y.into(),
                     x.into(),
                     width.into(),
-                    height.into(), 
+                    height.into(),
                     pitch,
                     &pixels,
                 );
