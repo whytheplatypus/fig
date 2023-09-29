@@ -29,7 +29,6 @@ struct RawFrame {
 struct Stack {
     count: usize,
     index: usize,
-    // what if we split these up?
     frames: Vec<RawFrame>,
     width: u32,
     height: u32,
@@ -141,18 +140,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn chunck_frame(
-    top: i32,
-    left: i32,
-    width: u32,
-    height: u32,
+    top: usize,
+    left: usize,
+    width: usize,
+    height: usize,
     pitch: usize,
     raw_pixels: &Vec<u8>,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut y = top as usize;
-    let local_pitch = width as usize * 4;
+    let mut y = top;
+    let local_pitch = width * 4;
     let mut pixel_square = Vec::new();
-    while y < (height + top as u32) as usize {
-        let start = y * pitch + left as usize * 4;
+    while y < height + top {
+        let start = y * pitch + left * 4;
         if start > raw_pixels.len() {
             return Err("bad start value".into());
         }
@@ -164,7 +163,7 @@ fn chunck_frame(
         pixel_square.extend_from_slice(pixel_row);
         y += 1;
     }
-    if pixel_square.len() % (width * 4) as usize != 0 || pixel_square.len() == 0 {
+    if pixel_square.len() % (width * 4) != 0 || pixel_square.len() == 0 {
         return Err("bad pixel square".into());
     }
     return Ok(pixel_square);
@@ -224,10 +223,10 @@ fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn st
                 );
                 //let pitch = frame.width as usize * 4;
                 let chunk = chunck_frame(
-                    y as i32,
-                    x as i32,
-                    width as u32,
-                    height as u32,
+                    y.into(),
+                    x.into(),
+                    width.into(),
+                    height.into(), 
                     pitch,
                     &pixels,
                 );
