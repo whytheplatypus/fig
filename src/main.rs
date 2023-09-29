@@ -1,7 +1,7 @@
+use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
-use sdl2::pixels::PixelFormatEnum;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
 use std::ffi::c_void;
@@ -9,24 +9,21 @@ use std::fs::File;
 use std::{thread, time::Duration};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
-use x11rb::errors::{ConnectionError, ReplyOrIdError};
+use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
 use x11rb::protocol::xinerama::query_screens;
 use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-/*
-struct Frame<'a> {
-    delay: u32,
-    texture: Texture<'a>,
-}
-*/
-
-struct RawFrame {
-    delay: u32,
+struct Square {
     rect: Rect,
     pitch: usize,
     pixels: Vec<u8>,
+}
+
+struct RawFrame {
+    delay: u32,
+    squares: Vec<Square>,
 }
 
 struct Stack {
@@ -53,12 +50,13 @@ impl Stack {
     }
 }
 
+const DIMENSION: usize = 32;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
     let gifs = dbg!(&args[1..args.len()]);
     let mut wallpapers = {
-
         let mut wallpapers = Vec::new();
 
         for gif in gifs {
@@ -74,9 +72,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         wallpapers
     };
 
-    let (conn, screen_num) = x11rb::connect(None).unwrap();
+    let (conn, screen_num) = x11rb::connect(None)?;
 
-    let screens = dbg!(query_screens(&conn).unwrap().reply().unwrap());
+    let screens = dbg!(query_screens(&conn)?.reply()?);
     let screen_rects = {
         let mut screen_rects = Vec::new();
         for screen in screens.screen_info {
@@ -91,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         screen_rects
     };
 
-    let win_id = create_desktop(&conn, screen_num).unwrap();
+    let win_id = create_desktop(&conn, screen_num)?;
     set_desktop_atoms(&conn, win_id)?;
     show_desktop(&conn, win_id)?;
 
@@ -104,14 +102,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut textures = Vec::new();
         // this would have to be gif rects, not screen rects, i think... this was probably part of the old problem
         for wallpaper in &wallpapers {
-            let mut texture = texture_creator
-                .create_texture(
-                    PixelFormatEnum::ABGR8888,
-                    TextureAccess::Streaming,
-                    wallpaper.width,
-                    wallpaper.height,
-                )
-                .unwrap();
+            let mut texture = texture_creator.create_texture(
+                PixelFormatEnum::ABGR8888,
+                TextureAccess::Streaming,
+                wallpaper.width,
+                wallpaper.height,
+            )?;
             texture.set_blend_mode(sdl2::render::BlendMode::Blend);
             textures.push(texture);
         }
@@ -131,8 +127,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if count % delay == 0 {
                 let frame = stack.next();
                 let texture = &mut textures[i % len];
-                texture.update(frame.rect, &frame.pixels, frame.pitch).unwrap();
-                canvas.copy(&texture, None, *rect).unwrap();
+                for square in &frame.squares {
+                    texture.update(square.rect, &square.pixels, square.pitch)?;
+                }
+                canvas.copy(&texture, None, *rect)?;
                 canvas.present();
             }
         }
@@ -141,31 +139,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
+fn chunk_frame(
+    top: usize,
+    left: usize,
+    width: usize,
+    height: usize,
+    pitch: usize,
+    bytes_per_pixel: usize,
+    raw_pixels: &Vec<u8>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut y = top;
+    let local_pitch = width * bytes_per_pixel;
+    let mut pixel_square = Vec::new();
+    while y < height + top {
+        let start = y * pitch + left * bytes_per_pixel;
+        if start > raw_pixels.len() {
+            return Err("bad start value".into());
+        }
+        let end = start + local_pitch;
+        if end > raw_pixels.len() {
+            return Err("bad end value".into());
+        }
+        let pixel_row = &raw_pixels[start..end];
+        pixel_square.extend_from_slice(pixel_row);
+        y += 1;
+    }
+    if pixel_square.len() % (width * bytes_per_pixel) != 0 || pixel_square.len() == 0 {
+        return Err("bad pixel square".into());
+    }
+    return Ok(pixel_square);
+}
+
+fn check_square(frames: &Vec<RawFrame>, square: &Square) -> bool {
+    for previoud_frame in frames.iter().rev() {
+        for previous_square in &previoud_frame.squares {
+            if previous_square.rect == square.rect {
+                if previous_square.pixels == square.pixels {
+                    return true;
+                }
+                return false;
+            }
+            // if the previous rect intersects with the current rect return false
+            if previous_square.rect.has_intersection(square.rect) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
 fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
     let file_in = File::open(gif)?;
     let mut decoder = gif::DecodeOptions::new();
     // Configure the decoder such that it will expand the image to RGBA.
     decoder.set_color_output(gif::ColorOutput::RGBA);
-    let mut decoder = decoder.read_info(file_in).unwrap();
+    let bytes_per_pixel = 4;
+    let mut decoder = decoder.read_info(file_in)?;
     let mut frames = Vec::new();
-    while let Some(frame) = decoder.read_next_frame().unwrap() {
+    while let Some(frame) = decoder.read_next_frame()? {
         // print the line_length
         let delay = frame.delay as u32;
-        let rect = Rect::new(
-            frame.left as i32,
-            frame.top as i32,
-            frame.width as u32,
-            frame.height as u32,
-        );
         // Process every frame
         let pixels = frame.buffer.to_vec();
-        let pitch = frame.width as usize * 4;
-        frames.push(RawFrame {
-            delay,
-            rect,
-            pixels,
-            pitch,
-        });
+        let pitch = frame.width as usize * bytes_per_pixel;
+        let mut squares = Vec::new();
+
+        for y in (0..frame.height).step_by(DIMENSION) {
+            let height = if y + DIMENSION as u16 > frame.height {
+                frame.height - y
+            } else {
+                DIMENSION as u16
+            };
+            for x in (0..frame.width).step_by(DIMENSION) {
+                let width = if x + DIMENSION as u16 > frame.width {
+                    frame.width - x
+                } else {
+                    DIMENSION as u16
+                };
+                let rect = Rect::new(
+                    (frame.left + x) as i32,
+                    (frame.top + y) as i32,
+                    width as u32,
+                    height as u32,
+                );
+                let chunk = chunk_frame(
+                    y.into(),
+                    x.into(),
+                    width.into(),
+                    height.into(),
+                    pitch,
+                    bytes_per_pixel,
+                    &pixels,
+                );
+                match chunk {
+                    Ok(chunk) => {
+                        let square = Square {
+                            rect,
+                            pitch: width as usize * bytes_per_pixel,
+                            pixels: chunk,
+                        };
+                        if check_square(&frames, &square) {
+                            continue;
+                        }
+                        squares.push(square);
+                    }
+                    Err(e) => {
+                        println!("error: {}", dbg!(e));
+                        continue;
+                    }
+                }
+            }
+        }
+
+        frames.push(RawFrame { delay, squares });
     }
 
     let width = decoder.width();
@@ -191,30 +277,55 @@ fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Erro
     Ok(canvas)
 }
 
+#[derive(Debug)]
+enum X11Error {
+    ConnectionError(ConnectionError),
+    ReplyError(ReplyError),
+}
+
+impl std::error::Error for X11Error {}
+
+impl std::fmt::Display for X11Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            X11Error::ConnectionError(e) => write!(f, "ConnectionError: {}", e),
+            X11Error::ReplyError(e) => write!(f, "ReplyError: {}", e),
+        }
+    }
+}
+
+impl From<ConnectionError> for X11Error {
+    fn from(e: ConnectionError) -> Self {
+        X11Error::ConnectionError(e)
+    }
+}
+
+impl From<ReplyError> for X11Error {
+    fn from(e: ReplyError) -> Self {
+        X11Error::ReplyError(e)
+    }
+}
+
 fn set_desktop_atoms(
     conn: &impl Connection,
     win_id: u32,
-) -> Result<VoidCookie<'_, impl Connection>, ConnectionError> {
+) -> Result<VoidCookie<'_, impl Connection>, X11Error> {
     let atom_wm_type = conn
-        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
-        .unwrap()
-        .reply()
-        .unwrap()
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE")?
+        .reply()?
         .atom;
     let atom_wm_desktop = conn
-        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")
-        .unwrap()
-        .reply()
-        .unwrap()
+        .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")?
+        .reply()?
         .atom;
 
-    conn.change_property32(
+    Ok(conn.change_property32(
         PropMode::REPLACE,
         win_id,
         atom_wm_type,
         AtomEnum::ATOM,
         &[atom_wm_desktop],
-    )
+    )?)
 }
 
 fn show_desktop(conn: &impl Connection, win_id: u32) -> Result<(), ConnectionError> {
