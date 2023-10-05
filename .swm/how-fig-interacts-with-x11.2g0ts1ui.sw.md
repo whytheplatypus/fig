@@ -13,12 +13,12 @@ First fig gets a connection to the x11 server
 <!-- NOTE-swimm-snippet: the lines below link your snippet to Swimm -->
 ### 📄 src/main.rs
 ```renderscript
-77         let (conn, screen_num) = x11rb::connect(None).unwrap();
+75         let (conn, screen_num) = x11rb::connect(None)?;
 ```
 
 <br/>
 
-Don't worry about closing `conn`<swm-token data-swm-token=":src/main.rs:77:4:4:`    let (conn, screen_num) = x11rb::connect(None).unwrap();`"/> it's automatically cleaned up by the rust implementation of the connection `drop` trait.
+Don't worry about closing `conn`<swm-token data-swm-token=":src/main.rs:75:4:4:`    let (conn, screen_num) = x11rb::connect(None)?;`"/> it's automatically cleaned up by the rust implementation of the connection `drop` trait.
 
 <br/>
 
@@ -26,20 +26,20 @@ then it gets the dimensions of the existing screens for later use. This is what 
 <!-- NOTE-swimm-snippet: the lines below link your snippet to Swimm -->
 ### 📄 src/main.rs
 ```renderscript
-79         let screens = dbg!(query_screens(&conn).unwrap().reply().unwrap());
-80         let screen_rects = {
-81             let mut screen_rects = Vec::new();
-82             for screen in screens.screen_info {
-83                 let rect = Rect::new(
-84                     screen.x_org as i32,
-85                     screen.y_org as i32,
-86                     screen.width as u32,
-87                     screen.height as u32,
-88                 );
-89                 screen_rects.push(rect);
-90             }
-91             screen_rects
-92         };
+77         let screens = dbg!(query_screens(&conn)?.reply()?);
+78         let screen_rects = {
+79             let mut screen_rects = Vec::new();
+80             for screen in screens.screen_info {
+81                 let rect = Rect::new(
+82                     screen.x_org as i32,
+83                     screen.y_org as i32,
+84                     screen.width as u32,
+85                     screen.height as u32,
+86                 );
+87                 screen_rects.push(rect);
+88             }
+89             screen_rects
+90         };
 ```
 
 <br/>
@@ -48,7 +48,7 @@ A window id handle is created giving the rest of the program something to draw o
 <!-- NOTE-swimm-snippet: the lines below link your snippet to Swimm -->
 ### 📄 src/main.rs
 ```renderscript
-94         let win_id = create_desktop(&conn, screen_num).unwrap();
+92         let win_id = create_desktop(&conn, screen_num)?;
 ```
 
 <br/>
@@ -62,35 +62,30 @@ In order to tell a window manager how to treat this new drawing space some atoms
 
 <br/>
 
-This sets the `_NET_WM_WINDOW_TYPE`<swm-token data-swm-token=":src/main.rs:199:9:9:`        .intern_atom(false, b&quot;_NET_WM_WINDOW_TYPE&quot;)`"/> atom to the value `_NET_WM_WINDOW_TYPE_DESKTOP`<swm-token data-swm-token=":src/main.rs:205:9:9:`        .intern_atom(false, b&quot;_NET_WM_WINDOW_TYPE_DESKTOP&quot;)`"/>. Think of this as a key value set operation.
+This sets the `_NET_WM_WINDOW_TYPE`<swm-token data-swm-token=":src/main.rs:314:9:9:`        .intern_atom(false, b&quot;_NET_WM_WINDOW_TYPE&quot;)?`"/> atom to the value `_NET_WM_WINDOW_TYPE_DESKTOP`<swm-token data-swm-token=":src/main.rs:318:9:9:`        .intern_atom(false, b&quot;_NET_WM_WINDOW_TYPE_DESKTOP&quot;)?`"/>. Think of this as a key value set operation.
 <!-- NOTE-swimm-snippet: the lines below link your snippet to Swimm -->
 ### 📄 src/main.rs
 ```renderscript
-198        let atom_wm_type = conn
-199            .intern_atom(false, b"_NET_WM_WINDOW_TYPE")
-200            .unwrap()
-201            .reply()
-202            .unwrap()
-203            .atom;
-204        let atom_wm_desktop = conn
-205            .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")
-206            .unwrap()
-207            .reply()
-208            .unwrap()
-209            .atom;
-210    
-211        conn.change_property32(
-212            PropMode::REPLACE,
-213            win_id,
-214            atom_wm_type,
-215            AtomEnum::ATOM,
-216            &[atom_wm_desktop],
-217        )
+313        let atom_wm_type = conn
+314            .intern_atom(false, b"_NET_WM_WINDOW_TYPE")?
+315            .reply()?
+316            .atom;
+317        let atom_wm_desktop = conn
+318            .intern_atom(false, b"_NET_WM_WINDOW_TYPE_DESKTOP")?
+319            .reply()?
+320            .atom;
+321    
+322        Ok(conn.change_property32(
+323            PropMode::REPLACE,
+324            win_id,
+325            atom_wm_type,
+326            AtomEnum::ATOM,
+327            &[atom_wm_desktop],
 ```
 
 <br/>
 
-Next x11 is told to map the window and make it available for use with `show_desktop`<swm-token data-swm-token=":src/main.rs:96:1:1:`    show_desktop(&amp;conn, win_id)?;`"/>.
+Next x11 is told to map the window and make it available for use with `show_desktop`<swm-token data-swm-token=":src/main.rs:94:1:1:`    show_desktop(&amp;conn, win_id)?;`"/>.
 
 <br/>
 
