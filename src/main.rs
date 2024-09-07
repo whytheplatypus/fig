@@ -1,3 +1,4 @@
+use crossbeam_channel::{bounded, select, tick, Receiver};
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
@@ -51,6 +52,15 @@ impl Stack {
 }
 
 const DIMENSION: usize = 32;
+
+fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
+    let (sender, receiver) = bounded(100);
+    ctrlc::set_handler(move || {
+        let _ = sender.send(());
+    })?;
+
+    Ok(receiver)
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
@@ -120,22 +130,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .iter()
         .map(|wallpaper| wallpaper.total_time())
         .sum());
+
+    let ctrl_c_events = ctrl_channel()?;
+    let ticks = tick(Duration::from_millis(10));
     loop {
-        for (i, rect) in screen_rects.iter().enumerate() {
-            let stack = &mut wallpapers[i % len];
-            let delay = stack.peek().delay;
-            if count % delay == 0 {
-                let frame = stack.next();
-                let texture = &mut textures[i % len];
-                for square in &frame.squares {
-                    texture.update(square.rect, &square.pixels, square.pitch)?;
+        select! {
+            recv(ticks) -> _ => {
+                for (i, rect) in screen_rects.iter().enumerate() {
+                    let stack = &mut wallpapers[i % len];
+                    let delay = stack.peek().delay;
+                    if count % delay == 0 {
+                        let frame = stack.next();
+                        let texture = &mut textures[i % len];
+                        for square in &frame.squares {
+                            texture.update(square.rect, &square.pixels, square.pitch)?;
+                        }
+                        canvas.copy(&texture, None, *rect)?;
+                        canvas.present();
+                    }
                 }
-                canvas.copy(&texture, None, *rect)?;
-                canvas.present();
+                count = (count + 1) % max;
+            }
+            recv(ctrl_c_events) -> _ => {
+                println!();
+                println!("Goodbye!");
+                break Ok(());
             }
         }
-        count = (count + 1) % max;
-        thread::sleep(Duration::from_millis(10));
     }
 }
 

@@ -8,6 +8,8 @@ edition = "2021"
 [dependencies]
 sdl2-sys = "0.35.2"
 gif = "0.12.0"
+crossbeam-channel = "0.5"
+ctrlc = "3.4"
 
 [dependencies.x11rb]
 version = "0.11.0"
@@ -21,4 +23,3 @@ default-features = false
 features = [
     "image",
 ]
-
