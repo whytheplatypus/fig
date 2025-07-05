@@ -4,10 +4,12 @@ use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
 use sdl2_sys::SDL_CreateWindowFrom;
+use std::collections::HashMap;
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
-use std::{thread, time::Duration};
+use std::hash::{Hash, Hasher};
+use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
@@ -25,33 +27,236 @@ struct Square {
 struct RawFrame {
     delay: u32,
     squares: Vec<Square>,
+    disposal_method: gif::DisposalMethod,
+    frame_rect: Rect,
 }
 
-struct Stack {
-    count: usize,
-    index: usize,
-    frames: Vec<RawFrame>,
+struct LazyStack {
+    decoder: Option<gif::Decoder<File>>,
+    current_frame_index: usize,
+    frame_cache: Vec<RawFrame>,
+    cache_size: usize,
     width: u32,
     height: u32,
+    total_frames: usize,
+    gif_path: String,
 }
 
-impl Stack {
-    fn next(&mut self) -> &mut RawFrame {
-        let frame = &mut self.frames[self.index];
-        self.index = (self.index + 1) % self.count;
-        frame
+impl LazyStack {
+    fn new(gif_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        println!("Loading GIF: {}", gif_path);
+        let file_in = File::open(gif_path)
+            .map_err(|e| format!("Failed to open GIF file '{}': {}", gif_path, e))?;
+        let mut decoder = gif::DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::RGBA);
+        let decoder = decoder
+            .read_info(file_in)
+            .map_err(|e| format!("Failed to read GIF info from '{}': {}", gif_path, e))?;
+
+        let width = decoder.width() as u32;
+        let height = decoder.height() as u32;
+
+        let mut stack = LazyStack {
+            decoder: Some(decoder),
+            current_frame_index: 0,
+            frame_cache: Vec::new(),
+            cache_size: 10, // Balanced cache size for memory efficiency
+            width,
+            height,
+            total_frames: 0,
+            gif_path: gif_path.to_string(),
+        };
+
+        // Load the first frame immediately
+        stack.load_next_frame()?;
+        println!("Loaded GIF: {} ({}x{})", gif_path, width, height);
+
+        Ok(stack)
     }
 
-    fn peek(&self) -> &RawFrame {
-        &self.frames[self.index]
+    fn next(&mut self) -> Result<&RawFrame, Box<dyn std::error::Error>> {
+        // Ensure we have frames loaded
+        if self.frame_cache.is_empty() {
+            return Err("No frames available".into());
+        }
+
+        // Get current frame index before any mutations
+        let current_index = self.current_frame_index;
+
+        // Advance to next frame
+        self.current_frame_index = (self.current_frame_index + 1) % self.frame_cache.len();
+
+        // If we've cycled back to the beginning, try to load more frames
+        if self.current_frame_index == 0 && self.decoder.is_some() {
+            // Try to load next frame from decoder
+            if let Err(_) = self.load_next_frame() {
+                // End of GIF reached, restart decoder for next cycle
+                if let Err(_) = self.restart_gif() {
+                    // If restart fails, continue with cached frames
+                }
+            }
+        }
+
+        // Now get the frame reference after all mutations are done
+        if current_index < self.frame_cache.len() {
+            Ok(&self.frame_cache[current_index])
+        } else {
+            Err("Frame index out of bounds".into())
+        }
     }
 
-    fn total_time(&self) -> u32 {
-        self.frames.iter().map(|frame| frame.delay).sum()
+    fn peek(&self) -> Option<&RawFrame> {
+        self.frame_cache.get(self.current_frame_index)
+    }
+
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
+    fn load_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(mut decoder) = self.decoder.take() {
+            if let Some(frame) = decoder.read_next_frame()? {
+                let raw_frame = self.process_frame(&frame)?;
+
+                self.frame_cache.push(raw_frame);
+                self.total_frames += 1;
+
+                // Keep cache size limited
+                if self.frame_cache.len() > self.cache_size {
+                    self.frame_cache.remove(0);
+                    // Adjust current_frame_index if needed
+                    if self.current_frame_index > 0 {
+                        self.current_frame_index -= 1;
+                    }
+                }
+
+                self.decoder = Some(decoder);
+                Ok(())
+            } else {
+                // End of GIF
+                self.decoder = None;
+                Err("End of GIF reached".into())
+            }
+        } else {
+            Err("No decoder available".into())
+        }
+    }
+
+    fn restart_gif(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let file_in = File::open(&self.gif_path)?;
+        let mut decoder = gif::DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::RGBA);
+        let decoder = decoder.read_info(file_in)?;
+        self.decoder = Some(decoder);
+        // Don't reset current_frame_index here - let the caller handle it
+        Ok(())
+    }
+
+    fn process_frame(
+        &mut self,
+        frame: &gif::Frame,
+    ) -> Result<RawFrame, Box<dyn std::error::Error>> {
+        let delay = frame.delay as u32;
+        let disposal_method = frame.dispose;
+        let frame_rect = Rect::new(
+            frame.left as i32,
+            frame.top as i32,
+            frame.width as u32,
+            frame.height as u32,
+        );
+
+        // Handle GIF disposal methods properly
+        let pixels = frame.buffer.to_vec();
+
+        let pitch = frame.width as usize * 4; // 4 bytes per pixel (RGBA)
+        let mut squares = Vec::new();
+        let mut current_frame_hashes: HashMap<Rect, u64> = HashMap::new();
+
+        for y in (0..frame.height).step_by(DIMENSION) {
+            let height = if y + DIMENSION as u16 > frame.height {
+                frame.height - y
+            } else {
+                DIMENSION as u16
+            };
+            for x in (0..frame.width).step_by(DIMENSION) {
+                let width = if x + DIMENSION as u16 > frame.width {
+                    frame.width - x
+                } else {
+                    DIMENSION as u16
+                };
+                let rect = Rect::new(
+                    (frame.left + x) as i32,
+                    (frame.top + y) as i32,
+                    width as u32,
+                    height as u32,
+                );
+
+                match chunk_frame(
+                    y as usize,
+                    x as usize,
+                    width as usize,
+                    height as usize,
+                    pitch,
+                    4,
+                    &pixels,
+                ) {
+                    Ok(chunk) => {
+                        let square = Square {
+                            rect,
+                            pitch: width as usize * 4,
+                            pixels: chunk,
+                        };
+
+                        // Only check for duplicates within current frame to avoid
+                        // breaking GIF frame composition
+                        let pixel_hash = calculate_pixel_hash(&square.pixels);
+                        if let Some(&existing_hash) = current_frame_hashes.get(&square.rect) {
+                            if existing_hash == pixel_hash {
+                                continue; // Skip duplicate square within same frame
+                            }
+                        }
+                        current_frame_hashes.insert(square.rect, pixel_hash);
+
+                        squares.push(square);
+                    }
+                    Err(_) => continue,
+                }
+            }
+        }
+
+        Ok(RawFrame {
+            delay,
+            squares,
+            disposal_method,
+            frame_rect,
+        })
+    }
+
+    fn estimated_total_time(&self) -> u32 {
+        if self.frame_cache.is_empty() {
+            1000 // Default fallback
+        } else {
+            self.frame_cache
+                .iter()
+                .map(|frame| frame.delay)
+                .sum::<u32>()
+                * (self.total_frames.max(1) as u32 / self.frame_cache.len().max(1) as u32)
+        }
     }
 }
 
 const DIMENSION: usize = 32;
+
+fn calculate_pixel_hash(pixels: &[u8]) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    pixels.hash(&mut hasher);
+    hasher.finish()
+}
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
     let (sender, receiver) = bounded(100);
@@ -65,26 +270,20 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = env::args().collect();
 
-    let gifs = dbg!(&args[1..args.len()]);
+    let gifs = &args[1..args.len()];
     let mut wallpapers = {
         let mut wallpapers = Vec::new();
 
         for gif in gifs {
-            let (width, height, frames) = load_raw_frames(gif)?;
-            wallpapers.push(Stack {
-                count: frames.len(),
-                index: 0,
-                frames,
-                width,
-                height,
-            });
+            let stack = LazyStack::new(gif)?;
+            wallpapers.push(stack);
         }
         wallpapers
     };
 
     let (conn, screen_num) = x11rb::connect(None)?;
 
-    let screens = dbg!(query_screens(&conn)?.reply()?);
+    let screens = query_screens(&conn)?.reply()?;
     let screen_rects = {
         let mut screen_rects = Vec::new();
         for screen in screens.screen_info {
@@ -110,7 +309,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut textures = {
         let mut textures = Vec::new();
-        // this would have to be gif rects, not screen rects, i think... this was probably part of the old problem
         for wallpaper in &wallpapers {
             let mut texture = texture_creator.create_texture(
                 PixelFormatEnum::ABGR8888,
@@ -126,30 +324,75 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let len = wallpapers.len();
     let mut count: u32 = 0;
-    let max: u32 = dbg!(wallpapers
+    let max: u32 = wallpapers
         .iter()
-        .map(|wallpaper| wallpaper.total_time())
-        .sum());
+        .map(|wallpaper| wallpaper.estimated_total_time())
+        .sum();
 
     let ctrl_c_events = ctrl_channel()?;
-    let ticks = tick(Duration::from_millis(10));
+    let ticks = tick(Duration::from_millis(10)); // ~60 FPS for better performance
+
     loop {
         select! {
             recv(ticks) -> _ => {
                 for (i, rect) in screen_rects.iter().enumerate() {
                     let stack = &mut wallpapers[i % len];
-                    let delay = stack.peek().delay;
-                    if count % delay == 0 {
-                        let frame = stack.next();
-                        let texture = &mut textures[i % len];
-                        for square in &frame.squares {
-                            texture.update(square.rect, &square.pixels, square.pitch)?;
+
+                    let should_update = if let Some(current_frame) = stack.peek() {
+                        let delay_ms = (current_frame.delay * 10).max(16); // Convert centiseconds to milliseconds
+                        (count % delay_ms) == 0
+                    } else {
+                        // No frame available, forcing update
+                        true
+                    };
+
+                    if should_update {
+                        match stack.next() {
+                            Ok(frame) => {
+                                // Processing frame
+                                let texture = &mut textures[i % len];
+
+                                // Handle disposal method
+                                match frame.disposal_method {
+                                    gif::DisposalMethod::Background => {
+                                        // Clear only the frame area to background
+                                        let clear_pixels = vec![0u8; (frame.frame_rect.width() * frame.frame_rect.height() * 4) as usize];
+                                        if let Err(e) = texture.update(
+                                            Some(frame.frame_rect),
+                                            &clear_pixels,
+                                            (frame.frame_rect.width() * 4) as usize
+                                        ) {
+                                            eprintln!("Texture clear error: {}", e);
+                                        }
+                                    }
+                                    gif::DisposalMethod::Previous => {
+                                        // For Previous disposal, we would need to restore to previous frame
+                                        // For now, we'll handle it like Any (no disposal)
+                                    }
+                                    _ => {
+                                        // No disposal (Any) - leave as is
+                                    }
+                                }
+
+                                // Update with the current frame squares
+                                for square in &frame.squares {
+                                    if let Err(e) = texture.update(square.rect, &square.pixels, square.pitch) {
+                                        eprintln!("Texture update error: {}", e);
+                                        continue;
+                                    }
+                                }
+                                if let Err(e) = canvas.copy(&texture, None, *rect) {
+                                    eprintln!("Canvas copy error: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("Frame loading error: {}", e);
+                            }
                         }
-                        canvas.copy(&texture, None, *rect)?;
-                        canvas.present();
                     }
                 }
-                count = (count + 1) % max;
+                canvas.present();
+                count = (count + 16) % max.max(1); // Increment by tick interval, avoid division by zero
             }
             recv(ctrl_c_events) -> _ => {
                 println!();
@@ -188,97 +431,7 @@ fn chunk_frame(
     if pixel_square.len() % (width * bytes_per_pixel) != 0 || pixel_square.len() == 0 {
         return Err("bad pixel square".into());
     }
-    return Ok(pixel_square);
-}
-
-fn check_square(frames: &Vec<RawFrame>, square: &Square) -> bool {
-    for previoud_frame in frames.iter().rev() {
-        for previous_square in &previoud_frame.squares {
-            if previous_square.rect == square.rect {
-                if previous_square.pixels == square.pixels {
-                    return true;
-                }
-                return false;
-            }
-            // if the previous rect intersects with the current rect return false
-            if previous_square.rect.has_intersection(square.rect) {
-                return false;
-            }
-        }
-    }
-    return false;
-}
-
-fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
-    let file_in = File::open(gif)?;
-    let mut decoder = gif::DecodeOptions::new();
-    // Configure the decoder such that it will expand the image to RGBA.
-    decoder.set_color_output(gif::ColorOutput::RGBA);
-    let bytes_per_pixel = 4;
-    let mut decoder = decoder.read_info(file_in)?;
-    let mut frames = Vec::new();
-    while let Some(frame) = decoder.read_next_frame()? {
-        // print the line_length
-        let delay = frame.delay as u32;
-        // Process every frame
-        let pixels = frame.buffer.to_vec();
-        let pitch = frame.width as usize * bytes_per_pixel;
-        let mut squares = Vec::new();
-
-        for y in (0..frame.height).step_by(DIMENSION) {
-            let height = if y + DIMENSION as u16 > frame.height {
-                frame.height - y
-            } else {
-                DIMENSION as u16
-            };
-            for x in (0..frame.width).step_by(DIMENSION) {
-                let width = if x + DIMENSION as u16 > frame.width {
-                    frame.width - x
-                } else {
-                    DIMENSION as u16
-                };
-                let rect = Rect::new(
-                    (frame.left + x) as i32,
-                    (frame.top + y) as i32,
-                    width as u32,
-                    height as u32,
-                );
-                let chunk = chunk_frame(
-                    y.into(),
-                    x.into(),
-                    width.into(),
-                    height.into(),
-                    pitch,
-                    bytes_per_pixel,
-                    &pixels,
-                );
-                match chunk {
-                    Ok(chunk) => {
-                        let square = Square {
-                            rect,
-                            pitch: width as usize * bytes_per_pixel,
-                            pixels: chunk,
-                        };
-                        if check_square(&frames, &square) {
-                            continue;
-                        }
-                        squares.push(square);
-                    }
-                    Err(e) => {
-                        println!("error: {}", dbg!(e));
-                        continue;
-                    }
-                }
-            }
-        }
-
-        frames.push(RawFrame { delay, squares });
-    }
-
-    let width = decoder.width();
-    let height = decoder.height();
-
-    Ok((width as u32, height as u32, frames))
+    Ok(pixel_square)
 }
 
 fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Error>> {
@@ -290,7 +443,6 @@ fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Erro
         Window::from_ll(video_subsystem, sdl_win)
     };
 
-    // We get the canvas from which we can get the `TextureCreator`.
     let canvas: Canvas<Window> = win
         .into_canvas()
         .build()
@@ -354,7 +506,6 @@ fn show_desktop(conn: &impl Connection, win_id: u32) -> Result<(), ConnectionErr
     conn.flush()
 }
 
-// if I understand this right I could make this a trait on conn
 fn create_desktop(conn: &impl Connection, screen_num: usize) -> Result<u32, ReplyOrIdError> {
     let screen = &conn.setup().roots[screen_num];
     let width = screen.width_in_pixels;
