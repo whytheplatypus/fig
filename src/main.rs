@@ -526,18 +526,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_lazy_stack_creation() {
-        // This test would require a GIF file to be present
-        // For now, just verify the structure compiles
-        assert_eq!(DIMENSION, 64);
-    }
-}
-
 fn chunk_frame(
     top: usize,
     left: usize,
