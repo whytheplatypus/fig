@@ -35,12 +35,9 @@ struct LazyStack {
     decoder: Option<gif::Decoder<File>>,
     current_frame_index: usize,
     frame_cache: Vec<RawFrame>,
-    cache_size: usize,
     width: u32,
     height: u32,
     total_frames: usize,
-    gif_path: String,
-
     is_first_cycle: bool,
 }
 
@@ -62,22 +59,25 @@ impl LazyStack {
             decoder: Some(decoder),
             current_frame_index: 0,
             frame_cache: Vec::new(),
-            cache_size: 20, // Larger cache to prevent missing frames
             width,
             height,
             total_frames: 0,
-            gif_path: gif_path.to_string(),
-
             is_first_cycle: true,
         };
 
-        // Load multiple frames initially to fill cache
-        for _ in 0..5 {
-            if stack.load_next_frame().is_err() {
-                break;
+        // Load ALL frames into cache
+        println!("Loading all frames...");
+        let mut frame_count = 0;
+        while stack.load_next_frame().is_ok() {
+            frame_count += 1;
+            if frame_count % 10 == 0 {
+                println!("Loaded {} frames...", frame_count);
             }
         }
-        println!("Loaded GIF: {} ({}x{})", gif_path, width, height);
+        println!(
+            "Loaded GIF: {} ({}x{}) with {} frames",
+            gif_path, width, height, frame_count
+        );
 
         Ok(stack)
     }
@@ -99,22 +99,8 @@ impl LazyStack {
         // Advance to next frame
         self.current_frame_index = (self.current_frame_index + 1) % self.frame_cache.len();
 
-        // If we've cycled back to the beginning and there are more frames to load
-        if self.current_frame_index == 0 {
-            // Try to load more frames if decoder is available
-            while self.decoder.is_some() && self.frame_cache.len() < self.cache_size {
-                if let Err(_) = self.load_next_frame() {
-                    break; // End of GIF reached or error
-                }
-            }
-
-            // If no more frames to load and decoder is gone, restart for next cycle
-            if self.decoder.is_none() {
-                if let Err(_) = self.restart_gif() {
-                    // If restart fails, continue with cached frames
-                }
-            }
-        }
+        // Since we've loaded all frames, just cycle through the cache
+        // No need to reload frames or restart decoder
 
         // Now get the frame reference after all mutations are done
         if current_index < self.frame_cache.len() {
@@ -140,37 +126,18 @@ impl LazyStack {
         if let Some(mut decoder) = self.decoder.take() {
             if let Some(frame) = decoder.read_next_frame()? {
                 let raw_frame = self.process_frame(&frame)?;
-
-                // Always add to cache if we have room
-                if self.frame_cache.len() < self.cache_size {
-                    self.frame_cache.push(raw_frame);
-                    self.total_frames += 1;
-                    self.decoder = Some(decoder);
-                    Ok(())
-                } else {
-                    // Cache is full, we've loaded all we can
-                    self.decoder = Some(decoder);
-                    Err("Cache full".into())
-                }
+                self.frame_cache.push(raw_frame);
+                self.total_frames += 1;
+                self.decoder = Some(decoder);
+                Ok(())
             } else {
-                // End of GIF
+                // End of GIF - all frames loaded
                 self.decoder = None;
                 Err("End of GIF reached".into())
             }
         } else {
             Err("No decoder available".into())
         }
-    }
-
-    fn restart_gif(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let file_in = File::open(&self.gif_path)?;
-        let mut decoder = gif::DecodeOptions::new();
-        decoder.set_color_output(gif::ColorOutput::RGBA);
-        let decoder = decoder.read_info(file_in)?;
-        self.decoder = Some(decoder);
-        self.is_first_cycle = true;
-        // Don't reset current_frame_index here - let the caller handle it
-        Ok(())
     }
 
     fn process_frame(
