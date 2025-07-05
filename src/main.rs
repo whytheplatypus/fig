@@ -48,6 +48,7 @@ struct LazyStack {
     file_path: String,
     frames_loaded_from_file: usize,
     decoder_at_end: bool,
+    last_frame_delay: u32,
 }
 
 impl LazyStack {
@@ -79,6 +80,7 @@ impl LazyStack {
             file_path: gif_path.to_string(),
             frames_loaded_from_file: 0,
             decoder_at_end: false,
+            last_frame_delay: 0,
         };
 
         // Don't pre-load any frames - load them on demand
@@ -116,6 +118,9 @@ impl LazyStack {
         // Clone the frame to avoid borrow checker issues
         let frame = self.frame_cache[cache_pos].clone();
 
+        // Store the frame delay for timing
+        self.last_frame_delay = frame.delay;
+
         // If this is the first frame being processed, mark it as no longer first cycle
         if self.is_first_cycle && self.current_frame_index == 0 {
             self.is_first_cycle = false;
@@ -127,14 +132,8 @@ impl LazyStack {
         Ok(frame)
     }
 
-    fn peek(&self) -> Option<&RawFrame> {
-        if self.frame_cache.is_empty() {
-            return None;
-        }
-        let cache_pos = self
-            .current_frame_index
-            .saturating_sub(self.cache_start_index);
-        self.frame_cache.get(cache_pos)
+    fn last_frame_delay(&self) -> u32 {
+        self.last_frame_delay
     }
 
     fn width(&self) -> u32 {
@@ -251,6 +250,7 @@ impl LazyStack {
         self.is_first_cycle = true;
         self.frames_loaded_from_file = 0;
         self.decoder_at_end = false;
+        self.last_frame_delay = 0;
 
         // Don't pre-load frames on restart - load them on demand
 
@@ -424,13 +424,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for stack_index in 0..wallpapers.len() {
                     let stack = &mut wallpapers[stack_index];
 
-                    // Check if we should update this stack based on current frame delay
-                    let should_update = if let Some(current_frame) = stack.peek() {
-                        let delay_ms = (current_frame.delay.max(2) * 10) as u64; // Convert centiseconds to milliseconds, minimum 20ms
+                    // Check if we should update this stack based on last frame delay
+                    let should_update = if stack.last_frame_delay() > 0 {
+                        let delay_ms = (stack.last_frame_delay().max(2) * 10) as u64; // Convert centiseconds to milliseconds, minimum 20ms
                         let elapsed = last_frame_times[stack_index].elapsed();
                         elapsed >= Duration::from_millis(delay_ms)
                     } else {
-                        // No frame available, forcing update
+                        // No frame processed yet, forcing update
                         true
                     };
 
