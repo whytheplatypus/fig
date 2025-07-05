@@ -40,6 +40,7 @@ struct LazyStack {
     height: u32,
     total_frames: usize,
     gif_path: String,
+    frame_counter: u32,
 }
 
 impl LazyStack {
@@ -65,6 +66,7 @@ impl LazyStack {
             height,
             total_frames: 0,
             gif_path: gif_path.to_string(),
+            frame_counter: 0,
         };
 
         // Load the first frame immediately
@@ -107,14 +109,6 @@ impl LazyStack {
 
     fn peek(&self) -> Option<&RawFrame> {
         self.frame_cache.get(self.current_frame_index)
-    }
-
-    fn width(&self) -> u32 {
-        self.width
-    }
-
-    fn height(&self) -> u32 {
-        self.height
     }
 
     fn load_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -323,14 +317,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let len = wallpapers.len();
-    let mut count: u32 = 0;
-    let max: u32 = wallpapers
-        .iter()
-        .map(|wallpaper| wallpaper.estimated_total_time())
-        .sum();
 
     let ctrl_c_events = ctrl_channel()?;
-    let ticks = tick(Duration::from_millis(10)); // ~60 FPS for better performance
+    let ticks = tick(Duration::from_millis(10)); // 100 FPS for better timing granularity
 
     loop {
         select! {
@@ -338,9 +327,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (i, rect) in screen_rects.iter().enumerate() {
                     let stack = &mut wallpapers[i % len];
 
+                    // Increment frame counter for this stack
+                    stack.frame_counter += 1;
+
                     let should_update = if let Some(current_frame) = stack.peek() {
-                        let delay_ms = (current_frame.delay * 10).max(16); // Convert centiseconds to milliseconds
-                        (count % delay_ms) == 0
+                        let delay_ticks = current_frame.delay.max(1); // GIF delay in centiseconds = 10ms ticks
+                        (stack.frame_counter % delay_ticks) == 0
                     } else {
                         // No frame available, forcing update
                         true
@@ -392,7 +384,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 canvas.present();
-                count = (count + 16) % max.max(1); // Increment by tick interval, avoid division by zero
             }
             recv(ctrl_c_events) -> _ => {
                 println!();
