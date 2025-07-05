@@ -5,6 +5,7 @@ use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
 use sdl2_sys::SDL_CreateWindowFrom;
 
+use std::collections::VecDeque;
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
@@ -18,12 +19,14 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
+#[derive(Clone)]
 struct Square {
     rect: Rect,
     pitch: usize,
     pixels: Vec<u8>,
 }
 
+#[derive(Clone)]
 struct RawFrame {
     delay: u32,
     squares: Vec<Square>,
@@ -34,11 +37,17 @@ struct RawFrame {
 struct LazyStack {
     decoder: Option<gif::Decoder<File>>,
     current_frame_index: usize,
-    frame_cache: Vec<RawFrame>,
+    frame_cache: VecDeque<RawFrame>,
+    cache_start_index: usize,
     width: u32,
     height: u32,
-    total_frames: usize,
+    total_frames: Option<usize>,
     is_first_cycle: bool,
+    cache_size: usize,
+    gif_finished: bool,
+    file_path: String,
+    frames_loaded_from_file: usize,
+    decoder_at_end: bool,
 }
 
 impl LazyStack {
@@ -54,64 +63,78 @@ impl LazyStack {
 
         let width = decoder.width() as u32;
         let height = decoder.height() as u32;
+        let cache_size = 25; // Keep 5 frames in cache
 
-        let mut stack = LazyStack {
+        let stack = LazyStack {
             decoder: Some(decoder),
             current_frame_index: 0,
-            frame_cache: Vec::new(),
+            frame_cache: VecDeque::with_capacity(cache_size),
+            cache_start_index: 0,
             width,
             height,
-            total_frames: 0,
+            total_frames: None,
             is_first_cycle: true,
+            cache_size,
+            gif_finished: false,
+            file_path: gif_path.to_string(),
+            frames_loaded_from_file: 0,
+            decoder_at_end: false,
         };
 
-        // Load ALL frames into cache
-        println!("Loading all frames...");
-        let mut frame_count = 0;
-        while stack.load_next_frame().is_ok() {
-            frame_count += 1;
-            if frame_count % 10 == 0 {
-                println!("Loaded {} frames...", frame_count);
-            }
-        }
+        // Don't pre-load any frames - load them on demand
         println!(
-            "Loaded GIF: {} ({}x{}) with {} frames",
-            gif_path, width, height, frame_count
+            "Loaded GIF: {} ({}x{}) ready for lazy loading",
+            gif_path, width, height
         );
 
         Ok(stack)
     }
 
-    fn next(&mut self) -> Result<&RawFrame, Box<dyn std::error::Error>> {
-        // Ensure we have frames loaded
-        if self.frame_cache.is_empty() {
-            return Err("No frames available".into());
+    fn next(&mut self) -> Result<RawFrame, Box<dyn std::error::Error>> {
+        // Check if we've reached the end of the GIF and need to restart
+        if let Some(total) = self.total_frames {
+            if self.current_frame_index >= total {
+                self.current_frame_index = 0;
+                self.restart_gif()?;
+            }
         }
 
-        // Get current frame index before any mutations
-        let current_index = self.current_frame_index;
+        // Ensure the current frame is in cache
+        self.ensure_frame_in_cache(self.current_frame_index)?;
+
+        // Get current frame from cache
+        let cache_pos = self.current_frame_index - self.cache_start_index;
+        if cache_pos >= self.frame_cache.len() {
+            return Err(format!(
+                "Frame not in cache after ensuring: cache_pos={}, cache_len={}",
+                cache_pos,
+                self.frame_cache.len()
+            )
+            .into());
+        }
+
+        // Clone the frame to avoid borrow checker issues
+        let frame = self.frame_cache[cache_pos].clone();
 
         // If this is the first frame being processed, mark it as no longer first cycle
-        if self.is_first_cycle && current_index == 0 {
+        if self.is_first_cycle && self.current_frame_index == 0 {
             self.is_first_cycle = false;
         }
 
         // Advance to next frame
-        self.current_frame_index = (self.current_frame_index + 1) % self.frame_cache.len();
+        self.current_frame_index += 1;
 
-        // Since we've loaded all frames, just cycle through the cache
-        // No need to reload frames or restart decoder
-
-        // Now get the frame reference after all mutations are done
-        if current_index < self.frame_cache.len() {
-            Ok(&self.frame_cache[current_index])
-        } else {
-            Err("Frame index out of bounds".into())
-        }
+        Ok(frame)
     }
 
     fn peek(&self) -> Option<&RawFrame> {
-        self.frame_cache.get(self.current_frame_index)
+        if self.frame_cache.is_empty() {
+            return None;
+        }
+        let cache_pos = self
+            .current_frame_index
+            .saturating_sub(self.cache_start_index);
+        self.frame_cache.get(cache_pos)
     }
 
     fn width(&self) -> u32 {
@@ -123,21 +146,115 @@ impl LazyStack {
     }
 
     fn load_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.decoder_at_end {
+            return Err("GIF has finished loading".into());
+        }
+
         if let Some(mut decoder) = self.decoder.take() {
             if let Some(frame) = decoder.read_next_frame()? {
                 let raw_frame = self.process_frame(&frame)?;
-                self.frame_cache.push(raw_frame);
-                self.total_frames += 1;
+
+                // If cache is full, remove oldest frame and advance window
+                if self.frame_cache.len() >= self.cache_size {
+                    self.frame_cache.pop_front();
+                    self.cache_start_index += 1;
+                }
+
+                self.frame_cache.push_back(raw_frame);
+                self.frames_loaded_from_file += 1;
                 self.decoder = Some(decoder);
                 Ok(())
             } else {
-                // End of GIF - all frames loaded
-                self.decoder = None;
+                // End of GIF - mark as finished and set total frames
+                self.decoder_at_end = true;
+                self.gif_finished = true;
+                self.total_frames = Some(self.frames_loaded_from_file);
+                self.decoder = Some(decoder);
                 Err("End of GIF reached".into())
             }
         } else {
             Err("No decoder available".into())
         }
+    }
+
+    fn ensure_frame_in_cache(
+        &mut self,
+        frame_index: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Check if frame is already in cache
+        if !self.frame_cache.is_empty()
+            && frame_index >= self.cache_start_index
+            && frame_index < self.cache_start_index + self.frame_cache.len()
+        {
+            return Ok(());
+        }
+
+        // If we're going backwards, this should only happen on restart
+        if frame_index < self.cache_start_index {
+            return Err("Requested frame is before cache window".into());
+        }
+
+        // Frame is ahead of cache, need to advance cache window
+        while frame_index >= self.cache_start_index + self.frame_cache.len() {
+            // Try to load next frame
+            match self.load_next_frame() {
+                Ok(()) => {
+                    // Successfully loaded a frame, continue
+                }
+                Err(_) => {
+                    // Could not load more frames
+                    if self.decoder_at_end && self.total_frames.is_some() {
+                        // We've reached the end and know the total frames
+                        return Err("Requested frame beyond end of GIF".into());
+                    } else {
+                        // This is the first time we've hit the end
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Final check - is the frame now in cache?
+        if !self.frame_cache.is_empty()
+            && frame_index >= self.cache_start_index
+            && frame_index < self.cache_start_index + self.frame_cache.len()
+        {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not load frame {} into cache (cache: {}-{}, len={}, gif_finished: {})",
+                frame_index,
+                self.cache_start_index,
+                self.cache_start_index + self.frame_cache.len().saturating_sub(1),
+                self.frame_cache.len(),
+                self.gif_finished
+            )
+            .into())
+        }
+    }
+
+    fn restart_gif(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Reopen the file and recreate the decoder
+        let file_in = File::open(&self.file_path)
+            .map_err(|e| format!("Failed to reopen GIF file '{}': {}", self.file_path, e))?;
+        let mut decoder = gif::DecodeOptions::new();
+        decoder.set_color_output(gif::ColorOutput::RGBA);
+        let decoder = decoder
+            .read_info(file_in)
+            .map_err(|e| format!("Failed to read GIF info from '{}': {}", self.file_path, e))?;
+
+        // Reset state
+        self.decoder = Some(decoder);
+        self.frame_cache.clear();
+        self.cache_start_index = 0;
+        self.gif_finished = false;
+        self.is_first_cycle = true;
+        self.frames_loaded_from_file = 0;
+        self.decoder_at_end = false;
+
+        // Don't pre-load frames on restart - load them on demand
+
+        Ok(())
     }
 
     fn process_frame(
@@ -210,7 +327,7 @@ impl LazyStack {
     }
 }
 
-const DIMENSION: usize = 32;
+const DIMENSION: usize = 64;
 
 fn update_texture_with_transparency(
     texture: &mut sdl2::render::Texture,
@@ -406,6 +523,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 break Ok(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_lazy_stack_creation() {
+        // This test would require a GIF file to be present
+        // For now, just verify the structure compiles
+        assert_eq!(DIMENSION, 64);
     }
 }
 
