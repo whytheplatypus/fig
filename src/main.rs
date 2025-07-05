@@ -4,11 +4,11 @@ use sdl2::rect::Rect;
 use sdl2::render::{Canvas, TextureAccess};
 use sdl2::video::Window;
 use sdl2_sys::SDL_CreateWindowFrom;
-use std::collections::HashMap;
+
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
-use std::hash::{Hash, Hasher};
+
 use std::time::Duration;
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
@@ -40,7 +40,8 @@ struct LazyStack {
     height: u32,
     total_frames: usize,
     gif_path: String,
-    frame_counter: u32,
+
+    is_first_cycle: bool,
 }
 
 impl LazyStack {
@@ -61,16 +62,21 @@ impl LazyStack {
             decoder: Some(decoder),
             current_frame_index: 0,
             frame_cache: Vec::new(),
-            cache_size: 10, // Balanced cache size for memory efficiency
+            cache_size: 20, // Larger cache to prevent missing frames
             width,
             height,
             total_frames: 0,
             gif_path: gif_path.to_string(),
-            frame_counter: 0,
+
+            is_first_cycle: true,
         };
 
-        // Load the first frame immediately
-        stack.load_next_frame()?;
+        // Load multiple frames initially to fill cache
+        for _ in 0..5 {
+            if stack.load_next_frame().is_err() {
+                break;
+            }
+        }
         println!("Loaded GIF: {} ({}x{})", gif_path, width, height);
 
         Ok(stack)
@@ -85,14 +91,25 @@ impl LazyStack {
         // Get current frame index before any mutations
         let current_index = self.current_frame_index;
 
+        // If this is the first frame being processed, mark it as no longer first cycle
+        if self.is_first_cycle && current_index == 0 {
+            self.is_first_cycle = false;
+        }
+
         // Advance to next frame
         self.current_frame_index = (self.current_frame_index + 1) % self.frame_cache.len();
 
-        // If we've cycled back to the beginning, try to load more frames
-        if self.current_frame_index == 0 && self.decoder.is_some() {
-            // Try to load next frame from decoder
-            if let Err(_) = self.load_next_frame() {
-                // End of GIF reached, restart decoder for next cycle
+        // If we've cycled back to the beginning and there are more frames to load
+        if self.current_frame_index == 0 {
+            // Try to load more frames if decoder is available
+            while self.decoder.is_some() && self.frame_cache.len() < self.cache_size {
+                if let Err(_) = self.load_next_frame() {
+                    break; // End of GIF reached or error
+                }
+            }
+
+            // If no more frames to load and decoder is gone, restart for next cycle
+            if self.decoder.is_none() {
                 if let Err(_) = self.restart_gif() {
                     // If restart fails, continue with cached frames
                 }
@@ -111,25 +128,30 @@ impl LazyStack {
         self.frame_cache.get(self.current_frame_index)
     }
 
+    fn width(&self) -> u32 {
+        self.width
+    }
+
+    fn height(&self) -> u32 {
+        self.height
+    }
+
     fn load_next_frame(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(mut decoder) = self.decoder.take() {
             if let Some(frame) = decoder.read_next_frame()? {
                 let raw_frame = self.process_frame(&frame)?;
 
-                self.frame_cache.push(raw_frame);
-                self.total_frames += 1;
-
-                // Keep cache size limited
-                if self.frame_cache.len() > self.cache_size {
-                    self.frame_cache.remove(0);
-                    // Adjust current_frame_index if needed
-                    if self.current_frame_index > 0 {
-                        self.current_frame_index -= 1;
-                    }
+                // Always add to cache if we have room
+                if self.frame_cache.len() < self.cache_size {
+                    self.frame_cache.push(raw_frame);
+                    self.total_frames += 1;
+                    self.decoder = Some(decoder);
+                    Ok(())
+                } else {
+                    // Cache is full, we've loaded all we can
+                    self.decoder = Some(decoder);
+                    Err("Cache full".into())
                 }
-
-                self.decoder = Some(decoder);
-                Ok(())
             } else {
                 // End of GIF
                 self.decoder = None;
@@ -146,6 +168,7 @@ impl LazyStack {
         decoder.set_color_output(gif::ColorOutput::RGBA);
         let decoder = decoder.read_info(file_in)?;
         self.decoder = Some(decoder);
+        self.is_first_cycle = true;
         // Don't reset current_frame_index here - let the caller handle it
         Ok(())
     }
@@ -168,7 +191,6 @@ impl LazyStack {
 
         let pitch = frame.width as usize * 4; // 4 bytes per pixel (RGBA)
         let mut squares = Vec::new();
-        let mut current_frame_hashes: HashMap<Rect, u64> = HashMap::new();
 
         for y in (0..frame.height).step_by(DIMENSION) {
             let height = if y + DIMENSION as u16 > frame.height {
@@ -199,22 +221,12 @@ impl LazyStack {
                     &pixels,
                 ) {
                     Ok(chunk) => {
+                        // Include all squares, let texture update handle transparency
                         let square = Square {
                             rect,
                             pitch: width as usize * 4,
                             pixels: chunk,
                         };
-
-                        // Only check for duplicates within current frame to avoid
-                        // breaking GIF frame composition
-                        let pixel_hash = calculate_pixel_hash(&square.pixels);
-                        if let Some(&existing_hash) = current_frame_hashes.get(&square.rect) {
-                            if existing_hash == pixel_hash {
-                                continue; // Skip duplicate square within same frame
-                            }
-                        }
-                        current_frame_hashes.insert(square.rect, pixel_hash);
-
                         squares.push(square);
                     }
                     Err(_) => continue,
@@ -229,27 +241,20 @@ impl LazyStack {
             frame_rect,
         })
     }
-
-    fn estimated_total_time(&self) -> u32 {
-        if self.frame_cache.is_empty() {
-            1000 // Default fallback
-        } else {
-            self.frame_cache
-                .iter()
-                .map(|frame| frame.delay)
-                .sum::<u32>()
-                * (self.total_frames.max(1) as u32 / self.frame_cache.len().max(1) as u32)
-        }
-    }
 }
 
 const DIMENSION: usize = 32;
 
-fn calculate_pixel_hash(pixels: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    let mut hasher = DefaultHasher::new();
-    pixels.hash(&mut hasher);
-    hasher.finish()
+fn update_texture_with_transparency(
+    texture: &mut sdl2::render::Texture,
+    rect: sdl2::rect::Rect,
+    pixels: &[u8],
+    pitch: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Always update the texture - SDL will handle transparency properly
+    // This ensures we don't miss any pixels that should be updated
+    texture.update(rect, pixels, pitch)?;
+    Ok(())
 }
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -301,8 +306,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut canvas = create_canvas(win_id)?;
     let texture_creator = canvas.texture_creator();
 
+    let len = wallpapers.len();
+    if len == 0 {
+        return Err("No wallpapers provided".into());
+    }
+
     let mut textures = {
         let mut textures = Vec::new();
+        // Create one texture per wallpaper, not per screen
         for wallpaper in &wallpapers {
             let mut texture = texture_creator.create_texture(
                 PixelFormatEnum::ABGR8888,
@@ -316,39 +327,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         textures
     };
 
-    let len = wallpapers.len();
-
     let ctrl_c_events = ctrl_channel()?;
     let ticks = tick(Duration::from_millis(10)); // 100 FPS for better timing granularity
+
+    // Track last frame update time for each stack independently
+    let mut last_frame_times = vec![std::time::Instant::now(); len];
 
     loop {
         select! {
             recv(ticks) -> _ => {
-                for (i, rect) in screen_rects.iter().enumerate() {
-                    let stack = &mut wallpapers[i % len];
+                // Update each wallpaper stack independently
+                for stack_index in 0..wallpapers.len() {
+                    let stack = &mut wallpapers[stack_index];
 
-                    // Increment frame counter for this stack
-                    stack.frame_counter += 1;
-
+                    // Check if we should update this stack based on current frame delay
                     let should_update = if let Some(current_frame) = stack.peek() {
-                        let delay_ticks = current_frame.delay.max(1); // GIF delay in centiseconds = 10ms ticks
-                        (stack.frame_counter % delay_ticks) == 0
+                        let delay_ms = (current_frame.delay.max(2) * 10) as u64; // Convert centiseconds to milliseconds, minimum 20ms
+                        let elapsed = last_frame_times[stack_index].elapsed();
+                        elapsed >= Duration::from_millis(delay_ms)
                     } else {
                         // No frame available, forcing update
                         true
                     };
 
                     if should_update {
+                        // Get values before mutable borrow
+                        let is_first_cycle = stack.is_first_cycle;
+                        let width = stack.width();
+                        let height = stack.height();
+
                         match stack.next() {
                             Ok(frame) => {
-                                // Processing frame
-                                let texture = &mut textures[i % len];
+                                // Update last frame time for this stack
+                                last_frame_times[stack_index] = std::time::Instant::now();
 
-                                // Handle disposal method
+                                // Processing frame - use stack index for texture
+                                let texture = &mut textures[stack_index];
+
+                                // Clear texture completely if this is the first frame of a new cycle
+                                if is_first_cycle {
+                                    let clear_pixels = vec![0u8; (width * height * 4) as usize];
+                                    if let Err(e) = texture.update(
+                                        None,
+                                        &clear_pixels,
+                                        (width * 4) as usize
+                                    ) {
+                                        eprintln!("Texture clear error: {}", e);
+                                    }
+                                }
+
+                                // Handle GIF disposal method for proper frame composition
                                 match frame.disposal_method {
                                     gif::DisposalMethod::Background => {
-                                        // Clear only the frame area to background
-                                        let clear_pixels = vec![0u8; (frame.frame_rect.width() * frame.frame_rect.height() * 4) as usize];
+                                        // Clear only the frame area to background (transparent)
+                                        let clear_size = (frame.frame_rect.width() * frame.frame_rect.height() * 4) as usize;
+                                        let clear_pixels = vec![0u8; clear_size];
                                         if let Err(e) = texture.update(
                                             Some(frame.frame_rect),
                                             &clear_pixels,
@@ -359,28 +392,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     }
                                     gif::DisposalMethod::Previous => {
                                         // For Previous disposal, we would need to restore to previous frame
-                                        // For now, we'll handle it like Any (no disposal)
+                                        // For now, treat like Any (no disposal) - this is complex to implement fully
+                                        // But we can at least avoid clearing the frame area
                                     }
                                     _ => {
-                                        // No disposal (Any) - leave as is
+                                        // No disposal (Any) - leave frame as is for differential composition
+                                        // This is the most common case for animated GIFs
                                     }
                                 }
 
-                                // Update with the current frame squares
+                                // Update with the current frame squares, handling transparency properly
                                 for square in &frame.squares {
-                                    if let Err(e) = texture.update(square.rect, &square.pixels, square.pitch) {
+                                    if let Err(e) = update_texture_with_transparency(
+                                        texture,
+                                        square.rect,
+                                        &square.pixels,
+                                        square.pitch,
+                                    ) {
                                         eprintln!("Texture update error: {}", e);
                                         continue;
                                     }
                                 }
-                                if let Err(e) = canvas.copy(&texture, None, *rect) {
-                                    eprintln!("Canvas copy error: {}", e);
-                                }
+
                             }
                             Err(e) => {
                                 eprintln!("Frame loading error: {}", e);
                             }
                         }
+                    }
+                }
+
+                // Now render all textures to their respective screens
+                for (screen_index, rect) in screen_rects.iter().enumerate() {
+                    let texture_index = screen_index % textures.len();
+                    let texture = &textures[texture_index];
+
+                    if let Err(e) = canvas.copy(texture, None, *rect) {
+                        eprintln!("Canvas copy error: {}", e);
                     }
                 }
                 canvas.present();
