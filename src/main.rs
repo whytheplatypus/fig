@@ -7,7 +7,8 @@ use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
 use std::ffi::c_void;
 use std::fs::File;
-use std::{thread, time::Duration};
+use std::io::BufReader;
+use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
 use x11rb::errors::{ConnectionError, ReplyError, ReplyOrIdError};
@@ -16,6 +17,7 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
+#[derive(Clone)]
 struct Square {
     rect: Rect,
     pitch: usize,
@@ -27,137 +29,175 @@ struct RawFrame {
     squares: Vec<Square>,
 }
 
+const DIMENSION: usize = 32;
+
+/// Streams a GIF one frame at a time instead of decoding the whole file
+/// up front. Only the previous frame's squares are kept around (to skip
+/// re-uploading pixels that didn't change), not the full frame history.
 struct Stack {
-    count: usize,
-    index: usize,
-    frames: Vec<RawFrame>,
+    decoder: gif::Decoder<BufReader<File>>,
+    file_path: String,
     width: u32,
     height: u32,
+    previous_squares: Vec<Square>,
+    // Centiseconds, per the GIF spec. 0 means "no frame shown yet".
+    last_frame_delay: u32,
 }
 
 impl Stack {
-    fn next(&mut self) -> &mut RawFrame {
-        let frame = &mut self.frames[self.index];
-        self.index = (self.index + 1) % self.count;
-        frame
+    fn open(gif_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let decoder = open_decoder(gif_path)?;
+        let width = decoder.width() as u32;
+        let height = decoder.height() as u32;
+        Ok(Stack {
+            decoder,
+            file_path: gif_path.to_string(),
+            width,
+            height,
+            previous_squares: Vec::new(),
+            last_frame_delay: 0,
+        })
     }
 
-    fn peek(&self) -> &RawFrame {
-        &self.frames[self.index]
+    /// Decode and return the next frame, looping back to the start of the
+    /// file once the GIF ends. `gif::Decoder` can't rewind, so looping
+    /// means reopening the file -- the OS page cache keeps that cheap
+    /// after the first pass.
+    fn next(&mut self) -> Result<RawFrame, Box<dyn std::error::Error>> {
+        // `read_next_frame()` returns a reference borrowed from
+        // `self.decoder`, so pull everything we need out into owned data
+        // here first -- that lets the borrow end before we call
+        // `process_frame`, which needs its own `&mut self`.
+        let frame_data = self.read_frame_data()?;
+        let raw_frame = self.process_frame(frame_data);
+        self.last_frame_delay = raw_frame.delay;
+        Ok(raw_frame)
     }
 
-    fn total_time(&self) -> u32 {
-        self.frames.iter().map(|frame| frame.delay).sum()
+    fn read_frame_data(&mut self) -> Result<FrameData, Box<dyn std::error::Error>> {
+        let frame = match self.decoder.read_next_frame()? {
+            Some(frame) => frame,
+            None => {
+                self.decoder = open_decoder(&self.file_path)?;
+                self.previous_squares.clear();
+                self.decoder
+                    .read_next_frame()?
+                    .ok_or("gif has no frames")?
+            }
+        };
+        Ok(FrameData {
+            delay: frame.delay,
+            left: frame.left,
+            top: frame.top,
+            width: frame.width,
+            height: frame.height,
+            pixels: frame.buffer.to_vec(),
+        })
     }
-}
 
-const DIMENSION: usize = 32;
+    fn process_frame(&mut self, frame: FrameData) -> RawFrame {
+        let bytes_per_pixel = 4;
+        // Floor the delay so a GIF frame with delay=0 (common in poorly
+        // optimized files) can't cause a runaway-fast loop or, in the
+        // timing check below, a divide/modulo-by-zero.
+        let delay = (frame.delay as u32).max(2);
+        let pixels = &frame.pixels;
+        let pitch = frame.width as usize * bytes_per_pixel;
+        let mut squares = Vec::new();
 
-fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
-    let (sender, receiver) = bounded(100);
-    ctrlc::set_handler(move || {
-        let _ = sender.send(());
-    })?;
-
-    Ok(receiver)
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
-
-    let gifs = dbg!(&args[1..args.len()]);
-    let mut wallpapers = {
-        let mut wallpapers = Vec::new();
-
-        for gif in gifs {
-            let (width, height, frames) = load_raw_frames(gif)?;
-            wallpapers.push(Stack {
-                count: frames.len(),
-                index: 0,
-                frames,
-                width,
-                height,
-            });
-        }
-        wallpapers
-    };
-
-    let (conn, screen_num) = x11rb::connect(None)?;
-
-    let screens = dbg!(query_screens(&conn)?.reply()?);
-    let screen_rects = {
-        let mut screen_rects = Vec::new();
-        for screen in screens.screen_info {
-            let rect = Rect::new(
-                screen.x_org as i32,
-                screen.y_org as i32,
-                screen.width as u32,
-                screen.height as u32,
-            );
-            screen_rects.push(rect);
-        }
-        screen_rects
-    };
-
-    let win_id = create_desktop(&conn, screen_num)?;
-    set_desktop_atoms(&conn, win_id)?;
-    show_desktop(&conn, win_id)?;
-
-    println!("Created {:?}", win_id);
-
-    let mut canvas = create_canvas(win_id)?;
-    let texture_creator = canvas.texture_creator();
-
-    let mut textures = {
-        let mut textures = Vec::new();
-        // this would have to be gif rects, not screen rects, i think... this was probably part of the old problem
-        for wallpaper in &wallpapers {
-            let mut texture = texture_creator.create_texture(
-                PixelFormatEnum::ABGR8888,
-                TextureAccess::Streaming,
-                wallpaper.width,
-                wallpaper.height,
-            )?;
-            texture.set_blend_mode(sdl2::render::BlendMode::Blend);
-            textures.push(texture);
-        }
-        textures
-    };
-
-    let len = wallpapers.len();
-    let mut count: u32 = 0;
-    let max: u32 = dbg!(wallpapers
-        .iter()
-        .map(|wallpaper| wallpaper.total_time())
-        .sum());
-
-    let ctrl_c_events = ctrl_channel()?;
-    let ticks = tick(Duration::from_millis(10));
-    loop {
-        select! {
-            recv(ticks) -> _ => {
-                for (i, rect) in screen_rects.iter().enumerate() {
-                    let stack = &mut wallpapers[i % len];
-                    let delay = stack.peek().delay;
-                    if count % delay == 0 {
-                        let frame = stack.next();
-                        let texture = &mut textures[i % len];
-                        for square in &frame.squares {
-                            texture.update(square.rect, &square.pixels, square.pitch)?;
+        for y in (0..frame.height).step_by(DIMENSION) {
+            let height = if y + DIMENSION as u16 > frame.height {
+                frame.height - y
+            } else {
+                DIMENSION as u16
+            };
+            for x in (0..frame.width).step_by(DIMENSION) {
+                let width = if x + DIMENSION as u16 > frame.width {
+                    frame.width - x
+                } else {
+                    DIMENSION as u16
+                };
+                let rect = Rect::new(
+                    (frame.left + x) as i32,
+                    (frame.top + y) as i32,
+                    width as u32,
+                    height as u32,
+                );
+                match chunk_frame(
+                    y.into(),
+                    x.into(),
+                    width.into(),
+                    height.into(),
+                    pitch,
+                    bytes_per_pixel,
+                    &pixels,
+                ) {
+                    Ok(chunk) => {
+                        let square = Square {
+                            rect,
+                            pitch: width as usize * bytes_per_pixel,
+                            pixels: chunk,
+                        };
+                        // Skip squares whose pixels are identical to the
+                        // same position in the previous frame -- the SDL
+                        // texture already holds the right pixels there.
+                        // Unlike the original check_square(), this only
+                        // looks at the immediately previous frame (O(1)
+                        // memory) instead of scanning the GIF's entire
+                        // decoded history.
+                        if !unchanged(&self.previous_squares, &square) {
+                            squares.push(square);
                         }
-                        canvas.copy(&texture, None, *rect)?;
-                        canvas.present();
+                    }
+                    Err(e) => {
+                        eprintln!("chunk error: {}", e);
+                        continue;
                     }
                 }
-                count = (count + 1) % max;
-            }
-            recv(ctrl_c_events) -> _ => {
-                println!();
-                println!("Goodbye!");
-                break Ok(());
             }
         }
+
+        self.previous_squares = squares.clone();
+        RawFrame { delay, squares }
     }
+}
+
+struct FrameData {
+    delay: u16,
+    left: u16,
+    top: u16,
+    width: u16,
+    height: u16,
+    pixels: Vec<u8>,
+}
+
+fn open_decoder(gif_path: &str) -> Result<gif::Decoder<BufReader<File>>, Box<dyn std::error::Error>> {
+    let file_in = BufReader::new(
+        File::open(gif_path)
+            .map_err(|e| format!("Failed to open GIF file '{}': {}", gif_path, e))?,
+    );
+    let mut decoder = gif::DecodeOptions::new();
+    decoder.set_color_output(gif::ColorOutput::RGBA);
+    decoder
+        .read_info(file_in)
+        .map_err(|e| format!("Failed to read GIF info from '{}': {}", gif_path, e).into())
+}
+
+/// True if `square` is pixel-identical to the same-rect square in
+/// `previous`. Bails out (false) as soon as it hits a previous square
+/// that either has a different rect at the same grid slot or overlaps
+/// without matching exactly, since that means the grid alignment shifted
+/// between frames (GIF sub-frames can have different left/top offsets).
+fn unchanged(previous: &[Square], square: &Square) -> bool {
+    for previous_square in previous {
+        if previous_square.rect == square.rect {
+            return previous_square.pixels == square.pixels;
+        }
+        if previous_square.rect.has_intersection(square.rect) {
+            return false;
+        }
+    }
+    false
 }
 
 fn chunk_frame(
@@ -188,97 +228,132 @@ fn chunk_frame(
     if pixel_square.len() % (width * bytes_per_pixel) != 0 || pixel_square.len() == 0 {
         return Err("bad pixel square".into());
     }
-    return Ok(pixel_square);
+    Ok(pixel_square)
 }
 
-fn check_square(frames: &Vec<RawFrame>, square: &Square) -> bool {
-    for previoud_frame in frames.iter().rev() {
-        for previous_square in &previoud_frame.squares {
-            if previous_square.rect == square.rect {
-                if previous_square.pixels == square.pixels {
-                    return true;
-                }
-                return false;
-            }
-            // if the previous rect intersects with the current rect return false
-            if previous_square.rect.has_intersection(square.rect) {
-                return false;
-            }
+fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
+    let (sender, receiver) = bounded(100);
+    ctrlc::set_handler(move || {
+        let _ = sender.send(());
+    })?;
+
+    Ok(receiver)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<String> = env::args().collect();
+
+    let gifs = &args[1..args.len()];
+    let mut wallpapers = {
+        let mut wallpapers = Vec::new();
+
+        for gif in gifs {
+            wallpapers.push(Stack::open(gif)?);
         }
+        wallpapers
+    };
+
+    let (conn, screen_num) = x11rb::connect(None)?;
+
+    let screens = query_screens(&conn)?.reply()?;
+    let screen_rects = {
+        let mut screen_rects = Vec::new();
+        for screen in screens.screen_info {
+            let rect = Rect::new(
+                screen.x_org as i32,
+                screen.y_org as i32,
+                screen.width as u32,
+                screen.height as u32,
+            );
+            screen_rects.push(rect);
+        }
+        screen_rects
+    };
+
+    let win_id = create_desktop(&conn, screen_num)?;
+    set_desktop_atoms(&conn, win_id)?;
+    show_desktop(&conn, win_id)?;
+
+    println!("Created {:?}", win_id);
+
+    let mut canvas = create_canvas(win_id)?;
+    let texture_creator = canvas.texture_creator();
+
+    let len = wallpapers.len();
+    if len == 0 {
+        return Err("No wallpapers provided".into());
     }
-    return false;
-}
 
-fn load_raw_frames(gif: &String) -> Result<(u32, u32, Vec<RawFrame>), Box<dyn std::error::Error>> {
-    let file_in = File::open(gif)?;
-    let mut decoder = gif::DecodeOptions::new();
-    // Configure the decoder such that it will expand the image to RGBA.
-    decoder.set_color_output(gif::ColorOutput::RGBA);
-    let bytes_per_pixel = 4;
-    let mut decoder = decoder.read_info(file_in)?;
-    let mut frames = Vec::new();
-    while let Some(frame) = decoder.read_next_frame()? {
-        // print the line_length
-        let delay = frame.delay as u32;
-        // Process every frame
-        let pixels = frame.buffer.to_vec();
-        let pitch = frame.width as usize * bytes_per_pixel;
-        let mut squares = Vec::new();
+    let mut textures = {
+        let mut textures = Vec::new();
+        // One texture per wallpaper, not per screen -- screens that share
+        // a wallpaper just blit from the same texture below.
+        for wallpaper in &wallpapers {
+            let mut texture = texture_creator.create_texture(
+                PixelFormatEnum::ABGR8888,
+                TextureAccess::Streaming,
+                wallpaper.width,
+                wallpaper.height,
+            )?;
+            texture.set_blend_mode(sdl2::render::BlendMode::Blend);
+            textures.push(texture);
+        }
+        textures
+    };
 
-        for y in (0..frame.height).step_by(DIMENSION) {
-            let height = if y + DIMENSION as u16 > frame.height {
-                frame.height - y
-            } else {
-                DIMENSION as u16
-            };
-            for x in (0..frame.width).step_by(DIMENSION) {
-                let width = if x + DIMENSION as u16 > frame.width {
-                    frame.width - x
-                } else {
-                    DIMENSION as u16
-                };
-                let rect = Rect::new(
-                    (frame.left + x) as i32,
-                    (frame.top + y) as i32,
-                    width as u32,
-                    height as u32,
-                );
-                let chunk = chunk_frame(
-                    y.into(),
-                    x.into(),
-                    width.into(),
-                    height.into(),
-                    pitch,
-                    bytes_per_pixel,
-                    &pixels,
-                );
-                match chunk {
-                    Ok(chunk) => {
-                        let square = Square {
-                            rect,
-                            pitch: width as usize * bytes_per_pixel,
-                            pixels: chunk,
-                        };
-                        if check_square(&frames, &square) {
-                            continue;
-                        }
-                        squares.push(square);
-                    }
-                    Err(e) => {
-                        println!("error: {}", dbg!(e));
+    let ctrl_c_events = ctrl_channel()?;
+    let ticks = tick(Duration::from_millis(10));
+
+    // Per-wallpaper timing, so frame advancement no longer depends on a
+    // single shared counter (which drifted once more than one wallpaper
+    // or screen was involved) and can't divide/modulo by a zero delay.
+    let mut last_frame_times = vec![Instant::now(); len];
+
+    loop {
+        select! {
+            recv(ticks) -> _ => {
+                // Advance each wallpaper stack at most once per tick,
+                // regardless of how many screens display it -- previously
+                // a wallpaper shared by N screens was advanced N times
+                // per tick and played back N times too fast.
+                for (stack_index, stack) in wallpapers.iter_mut().enumerate() {
+                    let delay_ms = (stack.last_frame_delay as u64) * 10;
+                    let should_update = delay_ms == 0
+                        || last_frame_times[stack_index].elapsed() >= Duration::from_millis(delay_ms);
+
+                    if !should_update {
                         continue;
                     }
+
+                    match stack.next() {
+                        Ok(frame) => {
+                            last_frame_times[stack_index] = Instant::now();
+                            let texture = &mut textures[stack_index];
+                            for square in &frame.squares {
+                                if let Err(e) = texture.update(square.rect, &square.pixels, square.pitch) {
+                                    eprintln!("texture update error: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("frame loading error: {}", e);
+                        }
+                    }
                 }
+
+                for (screen_index, rect) in screen_rects.iter().enumerate() {
+                    let texture_index = screen_index % textures.len();
+                    canvas.copy(&textures[texture_index], None, *rect)?;
+                }
+                canvas.present();
+            }
+            recv(ctrl_c_events) -> _ => {
+                println!();
+                println!("Goodbye!");
+                break Ok(());
             }
         }
-
-        frames.push(RawFrame { delay, squares });
     }
-
-    let width = decoder.width();
-    let height = decoder.height();
-
-    Ok((width as u32, height as u32, frames))
 }
 
 fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Error>> {
@@ -290,7 +365,6 @@ fn create_canvas(win_id: u32) -> Result<Canvas<Window>, Box<dyn std::error::Erro
         Window::from_ll(video_subsystem, sdl_win)
     };
 
-    // We get the canvas from which we can get the `TextureCreator`.
     let canvas: Canvas<Window> = win
         .into_canvas()
         .build()
@@ -354,7 +428,6 @@ fn show_desktop(conn: &impl Connection, win_id: u32) -> Result<(), ConnectionErr
     conn.flush()
 }
 
-// if I understand this right I could make this a trait on conn
 fn create_desktop(conn: &impl Connection, screen_num: usize) -> Result<u32, ReplyOrIdError> {
     let screen = &conn.setup().roots[screen_num];
     let width = screen.width_in_pixels;
