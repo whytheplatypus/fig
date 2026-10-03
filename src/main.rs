@@ -1,13 +1,17 @@
+mod cache;
+mod frames;
+
+use cache::DeltaCache;
 use crossbeam_channel::{after, bounded, select, Receiver};
+use frames::{GifFrames, BYTES_PER_PIXEL};
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
 use sdl2::render::{Canvas, Texture, TextureAccess};
 use sdl2::video::Window;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
+use std::error::Error;
 use std::ffi::c_void;
-use std::fs::File;
-use std::io::BufReader;
 use std::time::{Duration, Instant};
 use x11rb::connection::Connection;
 use x11rb::cookie::VoidCookie;
@@ -17,122 +21,96 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-const BYTES_PER_PIXEL: usize = 4;
-
 /// How long to wait before retrying a wallpaper whose frame failed to load.
 const RETRY_DELAY: Duration = Duration::from_secs(1);
 
-/// Streams a GIF one frame at a time instead of decoding the whole file
-/// up front. The frame buffers are reused, so steady-state playback
-/// doesn't allocate.
-struct Stack {
-    decoder: gif::Decoder<BufReader<File>>,
-    file_path: String,
-    width: u32,
-    height: u32,
-    global_palette: Vec<u8>,
-    // Palette indices for the current frame, as decoded.
-    indices: Vec<u8>,
-    // The current frame expanded to RGBA, ready to upload.
-    pixels: Vec<u8>,
+/// Makes every wallpaper decode its GIF as it plays instead of using a cache.
+const NO_CACHE_FLAG: &str = "--no-cache";
+
+/// An animation that plays into a texture one frame at a time.
+trait Wallpaper {
+    fn size(&self) -> (u32, u32);
+
+    /// Upload the next frame into `texture` and return how long to show it.
+    fn upload_next(&mut self, texture: &mut Texture) -> Result<Duration, Box<dyn Error>>;
 }
 
-/// What a frame's header tells us, read before its pixels are decoded.
-struct FrameInfo {
-    rect: Rect,
-    delay: Duration,
-    colors: [[u8; BYTES_PER_PIXEL]; 256],
+/// Plays a GIF by decoding each frame as it's needed. Only the frame's
+/// sub-rect is uploaded, as GIF encoders crop each frame to what changed.
+struct DecodedGif {
+    frames: GifFrames,
 }
 
-impl Stack {
-    fn open(gif_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let decoder = open_decoder(gif_path)?;
-        let width = decoder.width() as u32;
-        let height = decoder.height() as u32;
-        let global_palette = decoder.global_palette().unwrap_or(&[]).to_vec();
-        Ok(Stack {
-            decoder,
-            file_path: gif_path.to_string(),
-            width,
-            height,
-            global_palette,
-            indices: Vec::new(),
-            pixels: Vec::new(),
-        })
+impl Wallpaper for DecodedGif {
+    fn size(&self) -> (u32, u32) {
+        (self.frames.width() as u32, self.frames.height() as u32)
     }
 
-    /// Decode the next frame into `texture` and return how long to show
-    /// it, looping back to the start of the file once the GIF ends.
-    /// `gif::Decoder` can't rewind, so looping means reopening the file --
-    /// the OS page cache keeps that cheap after the first pass.
-    ///
-    /// Only the frame's own sub-rect is uploaded: GIF encoders already crop
-    /// each frame to the region that changed, so no further diffing is
-    /// worth doing here.
-    fn upload_next(&mut self, texture: &mut Texture) -> Result<Duration, Box<dyn std::error::Error>> {
-        let frame = match self.read_frame_info()? {
+    fn upload_next(&mut self, texture: &mut Texture) -> Result<Duration, Box<dyn Error>> {
+        let frame = match self.frames.next()? {
             Some(frame) => frame,
             None => {
-                self.decoder = open_decoder(&self.file_path)?;
-                self.read_frame_info()?.ok_or("gif has no frames")?
+                self.frames.rewind()?;
+                self.frames.next()?.ok_or("gif has no frames")?
             }
         };
-        let pixel_count = frame.rect.width() as usize * frame.rect.height() as usize;
-        self.indices.resize(pixel_count, 0);
-        self.decoder.read_into_buffer(&mut self.indices)?;
-
-        // Expanding indices to RGBA ourselves with a lookup table is about
-        // twice as fast as the gif crate's per-channel RGBA output.
-        self.pixels.resize(pixel_count * BYTES_PER_PIXEL, 0);
-        for (pixel, &index) in self.pixels.chunks_exact_mut(BYTES_PER_PIXEL).zip(&self.indices) {
-            pixel.copy_from_slice(&frame.colors[index as usize]);
-        }
-
-        texture.update(frame.rect, &self.pixels, frame.rect.width() as usize * BYTES_PER_PIXEL)?;
-        Ok(frame.delay)
-    }
-
-    fn read_frame_info(&mut self) -> Result<Option<FrameInfo>, gif::DecodingError> {
-        let global_palette = &self.global_palette;
-        Ok(self.decoder.next_frame_info()?.map(|frame| FrameInfo {
-            rect: Rect::new(
+        // An empty frame has nothing to upload, and Rect can't be empty.
+        if frame.width > 0 && frame.height > 0 {
+            let rect = Rect::new(
                 frame.left as i32,
                 frame.top as i32,
                 frame.width as u32,
                 frame.height as u32,
-            ),
-            // Floor the delay so a GIF frame with delay=0 (common in poorly
-            // optimized files) can't cause a runaway-fast loop.
-            delay: Duration::from_millis(frame.delay.max(2) as u64 * 10),
-            colors: rgba_table(
-                frame.palette.as_deref().unwrap_or(global_palette),
-                frame.transparent,
-            ),
-        }))
+            );
+            texture.update(rect, self.frames.pixels(), frame.width * BYTES_PER_PIXEL)?;
+        }
+        Ok(frame.delay)
     }
 }
 
-/// The RGBA color of each palette index. Indices past the end of the
-/// palette stay transparent black, as they do in the gif crate's RGBA output.
-fn rgba_table(palette: &[u8], transparent: Option<u8>) -> [[u8; BYTES_PER_PIXEL]; 256] {
-    let mut table = [[0; BYTES_PER_PIXEL]; 256];
-    for (index, (color, rgb)) in table.iter_mut().zip(palette.chunks_exact(3)).enumerate() {
-        let alpha = if transparent == Some(index as u8) { 0x00 } else { 0xFF };
-        *color = [rgb[0], rgb[1], rgb[2], alpha];
-    }
-    table
+/// Plays a GIF from its delta cache, uploading only the tiles each frame
+/// changes. This avoids decoding during playback.
+struct CachedGif {
+    cache: DeltaCache,
+    next_record: usize,
+    // One tile's RGBA pixels, ready to upload.
+    tile_pixels: Vec<u8>,
 }
 
-fn open_decoder(gif_path: &str) -> Result<gif::Decoder<BufReader<File>>, Box<dyn std::error::Error>> {
-    let file_in = BufReader::new(
-        File::open(gif_path)
-            .map_err(|e| format!("Failed to open GIF file '{}': {}", gif_path, e))?,
-    );
-    let mut decoder = gif::DecodeOptions::new();
-    decoder.set_color_output(gif::ColorOutput::Indexed);
-    decoder
-        .read_info(file_in)
-        .map_err(|e| format!("Failed to read GIF info from '{}': {}", gif_path, e).into())
+impl Wallpaper for CachedGif {
+    fn size(&self) -> (u32, u32) {
+        (self.cache.width(), self.cache.height())
+    }
+
+    fn upload_next(&mut self, texture: &mut Texture) -> Result<Duration, Box<dyn Error>> {
+        let record = self.next_record;
+        self.next_record = self.cache.following(record);
+        for tile in self.cache.tiles(record) {
+            tile.expand(&mut self.tile_pixels);
+            texture.update(tile.rect, &self.tile_pixels, tile.rect.width() as usize * BYTES_PER_PIXEL)?;
+        }
+        Ok(self.cache.delay(record))
+    }
+}
+
+/// Open `gif_path` for playback from its cache, or, if `use_cache` is off
+/// or the GIF can't be cached, by decoding it.
+fn open_wallpaper(gif_path: &str, use_cache: bool) -> Result<Box<dyn Wallpaper>, Box<dyn Error>> {
+    if use_cache {
+        match DeltaCache::open(gif_path) {
+            Ok(cache) => {
+                return Ok(Box::new(CachedGif {
+                    cache,
+                    next_record: 0,
+                    tile_pixels: Vec::new(),
+                }))
+            }
+            Err(e) => eprintln!("Not caching {}: {}; decoding it instead", gif_path, e),
+        }
+    }
+    Ok(Box::new(DecodedGif {
+        frames: GifFrames::open(gif_path)?,
+    }))
 }
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -144,15 +122,18 @@ fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
     Ok(receiver)
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args: Vec<String> = env::args().collect();
+fn main() -> Result<(), Box<dyn Error>> {
+    let args: Vec<String> = env::args().skip(1).collect();
+    let use_cache = !args.iter().any(|arg| arg == NO_CACHE_FLAG);
+    if use_cache {
+        cache::remove_stale();
+    }
 
-    let gifs = &args[1..args.len()];
     let mut wallpapers = {
         let mut wallpapers = Vec::new();
 
-        for gif in gifs {
-            wallpapers.push(Stack::open(gif)?);
+        for gif in args.iter().filter(|arg| *arg != NO_CACHE_FLAG) {
+            wallpapers.push(open_wallpaper(gif, use_cache)?);
         }
         wallpapers
     };
@@ -193,11 +174,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         // One texture per wallpaper, not per screen -- screens that share
         // a wallpaper just blit from the same texture below.
         for wallpaper in &wallpapers {
+            let (width, height) = wallpaper.size();
             let mut texture = texture_creator.create_texture(
                 PixelFormatEnum::ABGR8888,
                 TextureAccess::Streaming,
-                wallpaper.width,
-                wallpaper.height,
+                width,
+                height,
             )?;
             texture.set_blend_mode(sdl2::render::BlendMode::Blend);
             textures.push(texture);
