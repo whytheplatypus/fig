@@ -1,7 +1,7 @@
-use crossbeam_channel::{bounded, select, tick, Receiver};
+use crossbeam_channel::{after, bounded, select, Receiver};
 use sdl2::pixels::PixelFormatEnum;
 use sdl2::rect::Rect;
-use sdl2::render::{Canvas, TextureAccess};
+use sdl2::render::{Canvas, Texture, TextureAccess};
 use sdl2::video::Window;
 use sdl2_sys::SDL_CreateWindowFrom;
 use std::env;
@@ -17,31 +17,18 @@ use x11rb::protocol::xproto::*;
 use x11rb::wrapper::ConnectionExt as _;
 use x11rb::COPY_DEPTH_FROM_PARENT;
 
-#[derive(Clone)]
-struct Square {
-    rect: Rect,
-    pitch: usize,
-    pixels: Vec<u8>,
-}
+const BYTES_PER_PIXEL: usize = 4;
 
-struct RawFrame {
-    delay: u32,
-    squares: Vec<Square>,
-}
-
-const DIMENSION: usize = 32;
+/// How long to wait before retrying a wallpaper whose frame failed to load.
+const RETRY_DELAY: Duration = Duration::from_secs(1);
 
 /// Streams a GIF one frame at a time instead of decoding the whole file
-/// up front. Only the previous frame's squares are kept around (to skip
-/// re-uploading pixels that didn't change), not the full frame history.
+/// up front.
 struct Stack {
     decoder: gif::Decoder<BufReader<File>>,
     file_path: String,
     width: u32,
     height: u32,
-    previous_squares: Vec<Square>,
-    // Centiseconds, per the GIF spec. 0 means "no frame shown yet".
-    last_frame_delay: u32,
 }
 
 impl Stack {
@@ -54,121 +41,41 @@ impl Stack {
             file_path: gif_path.to_string(),
             width,
             height,
-            previous_squares: Vec::new(),
-            last_frame_delay: 0,
         })
     }
 
-    /// Decode and return the next frame, looping back to the start of the
-    /// file once the GIF ends. `gif::Decoder` can't rewind, so looping
-    /// means reopening the file -- the OS page cache keeps that cheap
-    /// after the first pass.
-    fn next(&mut self) -> Result<RawFrame, Box<dyn std::error::Error>> {
-        // `read_next_frame()` returns a reference borrowed from
-        // `self.decoder`, so pull everything we need out into owned data
-        // here first -- that lets the borrow end before we call
-        // `process_frame`, which needs its own `&mut self`.
-        let frame_data = self.read_frame_data()?;
-        let raw_frame = self.process_frame(frame_data);
-        self.last_frame_delay = raw_frame.delay;
-        Ok(raw_frame)
-    }
-
-    fn read_frame_data(&mut self) -> Result<FrameData, Box<dyn std::error::Error>> {
-        let frame = match self.decoder.read_next_frame()? {
-            Some(frame) => frame,
-            None => {
-                self.decoder = open_decoder(&self.file_path)?;
-                self.previous_squares.clear();
-                self.decoder
-                    .read_next_frame()?
-                    .ok_or("gif has no frames")?
-            }
-        };
-        Ok(FrameData {
-            delay: frame.delay,
-            left: frame.left,
-            top: frame.top,
-            width: frame.width,
-            height: frame.height,
-            pixels: frame.buffer.to_vec(),
-        })
-    }
-
-    fn process_frame(&mut self, frame: FrameData) -> RawFrame {
-        let bytes_per_pixel = 4;
-        // Floor the delay so a GIF frame with delay=0 (common in poorly
-        // optimized files) can't cause a runaway-fast loop or, in the
-        // timing check below, a divide/modulo-by-zero.
-        let delay = (frame.delay as u32).max(2);
-        let pixels = &frame.pixels;
-        let pitch = frame.width as usize * bytes_per_pixel;
-        let mut squares = Vec::new();
-
-        for y in (0..frame.height).step_by(DIMENSION) {
-            let height = if y + DIMENSION as u16 > frame.height {
-                frame.height - y
-            } else {
-                DIMENSION as u16
-            };
-            for x in (0..frame.width).step_by(DIMENSION) {
-                let width = if x + DIMENSION as u16 > frame.width {
-                    frame.width - x
-                } else {
-                    DIMENSION as u16
-                };
-                let rect = Rect::new(
-                    (frame.left + x) as i32,
-                    (frame.top + y) as i32,
-                    width as u32,
-                    height as u32,
-                );
-                match chunk_frame(
-                    y.into(),
-                    x.into(),
-                    width.into(),
-                    height.into(),
-                    pitch,
-                    bytes_per_pixel,
-                    &pixels,
-                ) {
-                    Ok(chunk) => {
-                        let square = Square {
-                            rect,
-                            pitch: width as usize * bytes_per_pixel,
-                            pixels: chunk,
-                        };
-                        // Skip squares whose pixels are identical to the
-                        // same position in the previous frame -- the SDL
-                        // texture already holds the right pixels there.
-                        // Unlike the original check_square(), this only
-                        // looks at the immediately previous frame (O(1)
-                        // memory) instead of scanning the GIF's entire
-                        // decoded history.
-                        if !unchanged(&self.previous_squares, &square) {
-                            squares.push(square);
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("chunk error: {}", e);
-                        continue;
-                    }
-                }
-            }
+    /// Decode the next frame into `texture` and return how long to show
+    /// it, looping back to the start of the file once the GIF ends.
+    /// `gif::Decoder` can't rewind, so looping means reopening the file --
+    /// the OS page cache keeps that cheap after the first pass.
+    fn upload_next(&mut self, texture: &mut Texture) -> Result<Duration, Box<dyn std::error::Error>> {
+        if let Some(frame) = self.decoder.read_next_frame()? {
+            return upload(frame, texture);
         }
-
-        self.previous_squares = squares.clone();
-        RawFrame { delay, squares }
+        self.decoder = open_decoder(&self.file_path)?;
+        let frame = self
+            .decoder
+            .read_next_frame()?
+            .ok_or("gif has no frames")?;
+        upload(frame, texture)
     }
 }
 
-struct FrameData {
-    delay: u16,
-    left: u16,
-    top: u16,
-    width: u16,
-    height: u16,
-    pixels: Vec<u8>,
+/// Copy `frame` into its sub-rect of `texture` and return how long the
+/// frame should be shown. GIF encoders already crop each frame to the
+/// region that changed, so no further diffing is worth doing here.
+fn upload(frame: &gif::Frame, texture: &mut Texture) -> Result<Duration, Box<dyn std::error::Error>> {
+    let rect = Rect::new(
+        frame.left as i32,
+        frame.top as i32,
+        frame.width as u32,
+        frame.height as u32,
+    );
+    texture.update(rect, &frame.buffer, frame.width as usize * BYTES_PER_PIXEL)?;
+    // Floor the delay so a GIF frame with delay=0 (common in poorly
+    // optimized files) can't cause a runaway-fast loop.
+    let centiseconds = frame.delay.max(2);
+    Ok(Duration::from_millis(centiseconds as u64 * 10))
 }
 
 fn open_decoder(gif_path: &str) -> Result<gif::Decoder<BufReader<File>>, Box<dyn std::error::Error>> {
@@ -181,54 +88,6 @@ fn open_decoder(gif_path: &str) -> Result<gif::Decoder<BufReader<File>>, Box<dyn
     decoder
         .read_info(file_in)
         .map_err(|e| format!("Failed to read GIF info from '{}': {}", gif_path, e).into())
-}
-
-/// True if `square` is pixel-identical to the same-rect square in
-/// `previous`. Bails out (false) as soon as it hits a previous square
-/// that either has a different rect at the same grid slot or overlaps
-/// without matching exactly, since that means the grid alignment shifted
-/// between frames (GIF sub-frames can have different left/top offsets).
-fn unchanged(previous: &[Square], square: &Square) -> bool {
-    for previous_square in previous {
-        if previous_square.rect == square.rect {
-            return previous_square.pixels == square.pixels;
-        }
-        if previous_square.rect.has_intersection(square.rect) {
-            return false;
-        }
-    }
-    false
-}
-
-fn chunk_frame(
-    top: usize,
-    left: usize,
-    width: usize,
-    height: usize,
-    pitch: usize,
-    bytes_per_pixel: usize,
-    raw_pixels: &Vec<u8>,
-) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    let mut y = top;
-    let local_pitch = width * bytes_per_pixel;
-    let mut pixel_square = Vec::new();
-    while y < height + top {
-        let start = y * pitch + left * bytes_per_pixel;
-        if start > raw_pixels.len() {
-            return Err("bad start value".into());
-        }
-        let end = start + local_pitch;
-        if end > raw_pixels.len() {
-            return Err("bad end value".into());
-        }
-        let pixel_row = &raw_pixels[start..end];
-        pixel_square.extend_from_slice(pixel_row);
-        y += 1;
-    }
-    if pixel_square.len() % (width * bytes_per_pixel) != 0 || pixel_square.len() == 0 {
-        return Err("bad pixel square".into());
-    }
-    Ok(pixel_square)
 }
 
 fn ctrl_channel() -> Result<Receiver<()>, ctrlc::Error> {
@@ -302,51 +161,51 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let ctrl_c_events = ctrl_channel()?;
-    let ticks = tick(Duration::from_millis(10));
 
-    // Per-wallpaper timing, so frame advancement no longer depends on a
-    // single shared counter (which drifted once more than one wallpaper
-    // or screen was involved) and can't divide/modulo by a zero delay.
-    let mut last_frame_times = vec![Instant::now(); len];
+    // When each wallpaper's next frame is due. Each wallpaper keeps its
+    // own schedule, so GIFs with different frame rates play independently.
+    let mut next_frame_at = vec![Instant::now(); len];
 
     loop {
-        select! {
-            recv(ticks) -> _ => {
-                // Advance each wallpaper stack at most once per tick,
-                // regardless of how many screens display it -- previously
-                // a wallpaper shared by N screens was advanced N times
-                // per tick and played back N times too fast.
-                for (stack_index, stack) in wallpapers.iter_mut().enumerate() {
-                    let delay_ms = (stack.last_frame_delay as u64) * 10;
-                    let should_update = delay_ms == 0
-                        || last_frame_times[stack_index].elapsed() >= Duration::from_millis(delay_ms);
-
-                    if !should_update {
-                        continue;
-                    }
-
-                    match stack.next() {
-                        Ok(frame) => {
-                            last_frame_times[stack_index] = Instant::now();
-                            let texture = &mut textures[stack_index];
-                            for square in &frame.squares {
-                                if let Err(e) = texture.update(square.rect, &square.pixels, square.pitch) {
-                                    eprintln!("texture update error: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("frame loading error: {}", e);
-                        }
-                    }
-                }
-
-                for (screen_index, rect) in screen_rects.iter().enumerate() {
-                    let texture_index = screen_index % textures.len();
-                    canvas.copy(&textures[texture_index], None, *rect)?;
-                }
-                canvas.present();
+        let now = Instant::now();
+        let mut changed = false;
+        // Advance each wallpaper at most once, regardless of how many
+        // screens display it.
+        for (stack_index, stack) in wallpapers.iter_mut().enumerate() {
+            if now < next_frame_at[stack_index] {
+                continue;
             }
+            match stack.upload_next(&mut textures[stack_index]) {
+                Ok(delay) => {
+                    // Schedule from the previous due time, not `now`, so
+                    // wake-up latency doesn't accumulate as drift. If we've
+                    // fallen a whole frame behind (e.g. after a suspend),
+                    // resync instead of racing to catch up.
+                    let due = next_frame_at[stack_index] + delay;
+                    next_frame_at[stack_index] = if due < now { now + delay } else { due };
+                    changed = true;
+                }
+                Err(e) => {
+                    eprintln!("frame loading error: {}", e);
+                    next_frame_at[stack_index] = now + RETRY_DELAY;
+                }
+            }
+        }
+
+        // Only redraw when a texture changed; between GIF frames the
+        // window already shows the right pixels.
+        if changed {
+            for (screen_index, rect) in screen_rects.iter().enumerate() {
+                let texture_index = screen_index % textures.len();
+                canvas.copy(&textures[texture_index], None, *rect)?;
+            }
+            canvas.present();
+        }
+
+        // Sleep until the earliest wallpaper is due rather than polling.
+        let wake_at = *next_frame_at.iter().min().expect("at least one wallpaper");
+        select! {
+            recv(after(wake_at.saturating_duration_since(Instant::now()))) -> _ => {}
             recv(ctrl_c_events) -> _ => {
                 println!();
                 println!("Goodbye!");
